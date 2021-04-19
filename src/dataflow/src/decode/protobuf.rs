@@ -7,12 +7,11 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use log::error;
-
+use dataflow_types::{DataflowError, DecodeError};
 use interchange::protobuf::{self, Decoder};
-use repr::{Diff, Row, Timestamp};
+use repr::Row;
 
-use super::{DecoderState, PushSession};
+use super::DecoderState;
 use crate::metrics::EVENTS_COUNTER;
 
 pub struct ProtobufDecoderState {
@@ -34,7 +33,7 @@ impl ProtobufDecoderState {
 }
 
 impl DecoderState for ProtobufDecoderState {
-    fn decode_key(&mut self, bytes: &[u8]) -> Result<Row, String> {
+    fn decode_key(&mut self, bytes: &[u8]) -> Result<Option<Row>, String> {
         // Note that we're passing `None` as the offset for the key -
         // since the key must remain stable (and we don't have an
         // offset available here anyway), we instruct the decoder to
@@ -43,7 +42,7 @@ impl DecoderState for ProtobufDecoderState {
             Ok(row) => {
                 if let Some(row) = row {
                     self.events_success += 1;
-                    Ok(row)
+                    Ok(Some(row))
                 } else {
                     self.events_error += 1;
                     Err("protobuf deserialization returned None".to_string())
@@ -76,27 +75,30 @@ impl DecoderState for ProtobufDecoderState {
     }
 
     /// give a session a plain value
-    fn give_value<'a>(
+    fn get_value(
         &mut self,
         bytes: &[u8],
         position: Option<i64>,
         _: Option<i64>,
-        session: &mut PushSession<'a, (Row, Timestamp, Diff)>,
-        time: Timestamp,
-    ) {
+    ) -> Option<Result<Row, DataflowError>> {
         match self.decoder.decode(bytes, position) {
             Ok(row) => {
                 if let Some(row) = row {
                     self.events_success += 1;
-                    session.give((row, time, 1));
+                    Some(Ok(row))
                 } else {
                     self.events_error += 1;
-                    error!("protobuf deserialization returned None");
+                    Some(Err(DataflowError::DecodeError(DecodeError::Text(format!(
+                        "protobuf deserialization returned None"
+                    )))))
                 }
             }
             Err(err) => {
                 self.events_error += 1;
-                error!("protobuf deserialization error: {:#}", err)
+                Some(Err(DataflowError::DecodeError(DecodeError::Text(format!(
+                    "protobuf deserialization error: {:#}",
+                    err
+                )))))
             }
         }
     }

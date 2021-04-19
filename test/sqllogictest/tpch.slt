@@ -234,7 +234,7 @@ ORDER BY
 | ArrangeBy (#0)
 
 %5 = Let l0 =
-| Join %0 %1 %2 %3 %4 (= #23 #25) (= #12 #21) (= #9 #17) (= #0 #16)
+| Join %0 %1 %2 %3 %4 (= #0 #16) (= #9 #17) (= #12 #21) (= #23 #25)
 | | implementation = DeltaQuery
 | |   delta %0 %2.(#0) %1.(#0) %3.(#0) %4.(#0)
 | |   delta %1 %3.(#0) %4.(#0) %2.(#1) %0.(#0)
@@ -328,7 +328,7 @@ ORDER BY
 | ArrangeBy (#0)
 
 %3 =
-| Join %0 %1 %2 (= #8 #17) (= #0 #9)
+| Join %0 %1 %2 (= #0 #9) (= #8 #17)
 | | implementation = DeltaQuery
 | |   delta %0 %1.(#1) %2.(#0)
 | |   delta %1 %0.(#0) %2.(#0)
@@ -569,7 +569,7 @@ ORDER BY
 | ArrangeBy (#0)
 
 %6 =
-| Join %0 %1 %2 %3 %4 %5 (= #35 #44) (= #24 #32) (= #7 #23) (= #3 #40) (= #0 #9)
+| Join %0 %1 %2 %3 %4 %5 (= #0 #9) (= #3 #40) (= #7 #23) (= #24 #32) (= #35 #44)
 | | implementation = DeltaQuery
 | |   delta %0 %4.(#0) %1.(#2) %2.(#0) %3.(#0) %5.(#0)
 | |   delta %1 %0.(#0) %2.(#0) %3.(#0) %4.(#0) %5.(#0)
@@ -660,7 +660,7 @@ ORDER BY
 | ArrangeBy (#0)
 
 %8 =
-| Join %0 %1 %2 %3 %4 %5 %6 %7 (= #51 #57) (= #44 #49) (= #33 #41) (= #16 #32) (= #12 #53) (= #9 #18) (= #0 #17)
+| Join %0 %1 %2 %3 %4 %5 %6 %7 (= #0 #17) (= #9 #18) (= #12 #53) (= #16 #32) (= #33 #41) (= #44 #49) (= #51 #57)
 | | implementation = DeltaQuery
 | |   delta %0 %2.(#1) %1.(#0) %3.(#0) %4.(#0) %5.(#0) %6.(#0) %7.(#0)
 | |   delta %1 %6.(#0) %2.(#2) %0.(#0) %3.(#0) %4.(#0) %5.(#0) %7.(#0)
@@ -743,7 +743,7 @@ ORDER BY
 | ArrangeBy (#0)
 
 %6 =
-| Join %0 %1 %2 %3 %4 %5 (= #9 #18 #33) (= #0 #17 #32) (= #16 #37) (= #12 #46)
+| Join %0 %1 %2 %3 %4 %5 (= #0 #17 #32) (= #9 #18 #33) (= #12 #46) (= #16 #37)
 | | implementation = DeltaQuery
 | |   delta %0 %2.(#1) %3.(#0, #1) %1.(#0) %4.(#0) %5.(#0)
 | |   delta %1 %5.(#0) %2.(#2) %3.(#0, #1) %0.(#0) %4.(#0)
@@ -813,7 +813,7 @@ ORDER BY
 | ArrangeBy (#0)
 
 %4 =
-| Join %0 %1 %2 %3 (= #8 #17) (= #3 #33) (= #0 #9)
+| Join %0 %1 %2 %3 (= #0 #9) (= #3 #33) (= #8 #17)
 | | implementation = DeltaQuery
 | |   delta %0 %3.(#0) %1.(#1) %2.(#0)
 | |   delta %1 %0.(#0) %3.(#0) %2.(#0)
@@ -873,7 +873,7 @@ ORDER BY
 | ArrangeBy (#0)
 
 %3 =
-| Join %0 %1 %2 (= #8 #12) (= #1 #5)
+| Join %0 %1 %2 (= #1 #5) (= #8 #12)
 | | implementation = DeltaQuery
 | |   delta %0 %1.(#0) %2.(#0)
 | |   delta %1 %2.(#0) %0.(#1)
@@ -896,7 +896,7 @@ ORDER BY
 | ArrangeBy (#0)
 
 %7 =
-| Join %4 %5 %6 (= #8 #12) (= #1 #5)
+| Join %4 %5 %6 (= #1 #5) (= #8 #12)
 | | implementation = DeltaQuery
 | |   delta %4 %5.(#0) %6.(#0)
 | |   delta %5 %6.(#0) %4.(#1)
@@ -967,8 +967,8 @@ ORDER BY
 | | demand = (#5, #19..#21, #23)
 | Filter ((#23 = "MAIL") || (#23 = "SHIP")), (#19 < #20), (#20 < #21), (datetots(#21) < 1995-01-01 00:00:00), (#21 >= 1994-01-01)
 | Reduce group=(#23)
-| | agg sum(if ((#5 = "1-URGENT") || (#5 = "2-HIGH")) then {1} else {0})
-| | agg sum(if ((#5 != "1-URGENT") && (#5 != "2-HIGH")) then {1} else {0})
+| | agg sum(if ((#5 = "2-HIGH") || (#5 = "1-URGENT")) then {1} else {0})
+| | agg sum(if ((#5 != "2-HIGH") && (#5 != "1-URGENT")) then {1} else {0})
 
 Finish order_by=(#0 asc) limit=none offset=0 project=(#0..#2)
 
@@ -1128,23 +1128,29 @@ WHERE
 ORDER BY
     s_suppkey
 ----
-%0 =
+%0 = Let l0 =
+| Get materialize.public.lineitem (u21)
+| Filter (datetots(#10) < 1996-04-01 00:00:00), (#10 >= 1996-01-01)
+| Reduce group=(#2)
+| | agg sum((#5 * (100dec - #6)))
+
+%1 =
 | Get materialize.public.supplier (u8)
 | ArrangeBy (#0)
 
-%1 =
-| Get materialize.public.revenue (u27)
+%2 =
+| Get %0 (l0)
 | ArrangeBy (#0)
 
-%2 =
-| Get materialize.public.revenue (u27)
+%3 =
+| Get %0 (l0)
 | Reduce group=()
 | | agg max(#1)
 | ArrangeBy (#0)
 
-%3 =
-| Join %0 %1 %2 (= #0 #7) (= #8 #9)
-| | implementation = Differential %0.(#0) %1.(#0) %2.(#0)
+%4 =
+| Join %1 %2 %3 (= #0 #7) (= #8 #9)
+| | implementation = Differential %1.(#0) %2.(#0) %3.(#0)
 | | demand = (#0..#2, #4, #8)
 | Project (#0..#2, #4, #8)
 
@@ -1203,7 +1209,7 @@ ORDER BY
 | |   delta %0 %1.(#0)
 | |   delta %1 %0.(#0)
 | | demand = (#1, #8..#10)
-| Filter !("^MEDIUM POLISHED.*$" ~(#9)), ((((((((#10 = 49) || (#10 = 14)) || (#10 = 23)) || (#10 = 45)) || (#10 = 19)) || (#10 = 3)) || (#10 = 36)) || (#10 = 9)), (#8 != "Brand#45")
+| Filter !("^MEDIUM POLISHED.*$" ~(#9)), ((((((((#10 = 14) || (#10 = 49)) || (#10 = 23)) || (#10 = 45)) || (#10 = 19)) || (#10 = 3)) || (#10 = 36)) || (#10 = 9)), (#8 != "Brand#45")
 
 %3 = Let l1 =
 | Get %2 (l0)
@@ -1379,7 +1385,7 @@ ORDER BY
 | ArrangeBy (#0)
 
 %3 = Let l0 =
-| Join %0 %1 %2 (= #8 #17) (= #0 #9)
+| Join %0 %1 %2 (= #0 #9) (= #8 #17)
 | | implementation = DeltaQuery
 | |   delta %0 %1.(#1) %2.(#0)
 | |   delta %1 %0.(#0) %2.(#0)
@@ -1470,7 +1476,7 @@ WHERE
 | |   delta %0 %1.(#0)
 | |   delta %1 %0.(#1)
 | | demand = (#4..#6, #13, #14, #19, #21, #22)
-| Filter (((((((#19 = "Brand#12") && ((((#22 = "SM CASE") || (#22 = "SM BOX")) || (#22 = "SM PACK")) || (#22 = "SM PKG"))) && (#4 >= 100dec)) && (#4 <= 1100dec)) && (#21 <= 5)) || (((((#19 = "Brand#23") && ((((#22 = "MED BAG") || (#22 = "MED BOX")) || (#22 = "MED PKG")) || (#22 = "MED PACK"))) && (#4 >= 1000dec)) && (#4 <= 2000dec)) && (#21 <= 10))) || (((((#19 = "Brand#34") && ((((#22 = "LG CASE") || (#22 = "LG BOX")) || (#22 = "LG PACK")) || (#22 = "LG PKG"))) && (#4 >= 2000dec)) && (#4 <= 3000dec)) && (#21 <= 15))), ((#14 = "AIR") || (#14 = "AIR REG")), (#13 = "DELIVER IN PERSON"), (#21 >= 1)
+| Filter (((((((((#22 = "LG BOX") || (#22 = "LG CASE")) || (#22 = "LG PACK")) || (#22 = "LG PKG")) && (#19 = "Brand#34")) && (#4 >= 2000dec)) && (#4 <= 3000dec)) && (#21 <= 15)) || (((((((((#22 = "SM BOX") || (#22 = "SM CASE")) || (#22 = "SM PACK")) || (#22 = "SM PKG")) && (#19 = "Brand#12")) && (#4 >= 100dec)) && (#4 <= 1100dec)) && (#21 <= 5)) || ((((((((#22 = "MED BAG") || (#22 = "MED BOX")) || (#22 = "MED PKG")) || (#22 = "MED PACK")) && (#19 = "Brand#23")) && (#4 >= 1000dec)) && (#4 <= 2000dec)) && (#21 <= 10)))), ((#14 = "AIR") || (#14 = "AIR REG")), (#13 = "DELIVER IN PERSON"), (#21 >= 1)
 | Reduce group=()
 | | agg sum((#5 * (100dec - #6)))
 
@@ -1580,7 +1586,7 @@ ORDER BY
 | ArrangeBy (#1, #2)
 
 %10 =
-| Join %8 %9 (= #1 #4) (= #0 #3)
+| Join %8 %9 (= #0 #3) (= #1 #4)
 | | implementation = DeltaQuery
 | |   delta %8 %9.(#1, #2)
 | |   delta %9 %8.(#0, #1)
@@ -1592,7 +1598,7 @@ ORDER BY
 | ArrangeBy (#0, #1)
 
 %11 =
-| Join %7 %10 (= #11 #25) (= #12 #26)
+| Join %7 %10 (= #0 #26) (= #11 #25)
 | | implementation = Differential %7 %10.(#0, #1)
 | | demand = (#0, #13, #28)
 | Filter ((i32todec(#13) * 1000dec) > #28)
@@ -1669,7 +1675,7 @@ ORDER BY
 | ArrangeBy (#0)
 
 %4 = Let l0 =
-| Join %0 %1 %2 %3 (= #7 #23) (= #3 #32) (= #0 #9)
+| Join %0 %1 %2 %3 (= #0 #9) (= #3 #32) (= #7 #23)
 | | implementation = DeltaQuery
 | |   delta %0 %3.(#0) %1.(#2) %2.(#0)
 | |   delta %1 %0.(#0) %2.(#0) %3.(#0)
@@ -1786,11 +1792,11 @@ ORDER BY
 ----
 %0 =
 | Get materialize.public.customer (u15)
-| Filter (((((((substr(#4, 1, 2) = "13") || (substr(#4, 1, 2) = "31")) || (substr(#4, 1, 2) = "23")) || (substr(#4, 1, 2) = "29")) || (substr(#4, 1, 2) = "30")) || (substr(#4, 1, 2) = "18")) || (substr(#4, 1, 2) = "17"))
+| Filter ((((((("13" = substr(#4, 1, 2)) || ("31" = substr(#4, 1, 2))) || ("23" = substr(#4, 1, 2))) || ("29" = substr(#4, 1, 2))) || ("30" = substr(#4, 1, 2))) || ("18" = substr(#4, 1, 2))) || ("17" = substr(#4, 1, 2)))
 
 %1 =
 | Get materialize.public.customer (u15)
-| Filter (((((((substr(#4, 1, 2) = "13") || (substr(#4, 1, 2) = "31")) || (substr(#4, 1, 2) = "23")) || (substr(#4, 1, 2) = "29")) || (substr(#4, 1, 2) = "30")) || (substr(#4, 1, 2) = "18")) || (substr(#4, 1, 2) = "17")), (#5 > 0dec)
+| Filter ((((((("13" = substr(#4, 1, 2)) || ("31" = substr(#4, 1, 2))) || ("23" = substr(#4, 1, 2))) || ("29" = substr(#4, 1, 2))) || ("30" = substr(#4, 1, 2))) || ("18" = substr(#4, 1, 2))) || ("17" = substr(#4, 1, 2))), (#5 > 0dec)
 | Reduce group=()
 | | agg sum(#5)
 | | agg count(true)

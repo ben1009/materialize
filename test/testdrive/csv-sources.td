@@ -107,3 +107,30 @@ Source error: File IO:
 
 ! CREATE SOURCE should_fail FROM FILE '/'
 / is a directory.
+
+# Static malformed CSV
+$ file-append path=malformed.csv
+Dollars,Category
+5161669,Clothing&Shoes
+1000000000
+,badrow
+badint,
+
+> CREATE MATERIALIZED SOURCE malformed_csv
+  FROM FILE '${testdrive.temp-dir}/malformed.csv'
+  FORMAT CSV WITH HEADER
+
+! SELECT * FROM malformed_csv
+Decode error: Text: CSV error at lineno 3: expected 2 columns, got 1.
+
+# Static non-utf-8 CSV
+$ file-append path=bad-text.csv
+Dollars,Category
+5161669,\x80
+
+> CREATE MATERIALIZED SOURCE bad_text_csv
+  FROM FILE '${testdrive.temp-dir}/bad-text.csv'
+  FORMAT CSV WITH HEADER
+
+! SELECT * FROM bad_text_csv
+Decode error: Text: CSV error at lineno 2: invalid UTF-8

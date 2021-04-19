@@ -25,7 +25,7 @@ use timely::logging::{ParkEvent, TimelyEvent, WorkerIdentifier};
 use super::{LogVariant, TimelyLog};
 use crate::arrangement::KeysValsHandle;
 use dataflow_types::logging::LoggingConfig;
-use repr::{Datum, Timestamp};
+use repr::{datum_list_size, datum_size, Datum, Row, Timestamp};
 
 /// Constructs the logging dataflows and returns a logger and trace handles.
 pub fn construct<A: Allocate>(
@@ -57,6 +57,8 @@ pub fn construct<A: Allocate>(
         let (mut channels_out, channels) = demux.new_output();
         let (mut addresses_out, addresses) = demux.new_output();
         let (mut parks_out, parks) = demux.new_output();
+        let (mut messages_sent_out, messages_sent) = demux.new_output();
+        let (mut messages_received_out, messages_received) = demux.new_output();
 
         let mut demux_buffer = Vec::new();
         demux.build(move |_capability| {
@@ -66,12 +68,13 @@ pub fn construct<A: Allocate>(
             let mut operates_data = HashMap::new();
             let mut channels_data = HashMap::new();
             let mut parks_data = HashMap::new();
-            let mut row_packer = repr::RowPacker::new();
             move |_frontiers| {
                 let mut operates = operates_out.activate();
                 let mut channels = channels_out.activate();
                 let mut addresses = addresses_out.activate();
                 let mut parks = parks_out.activate();
+                let mut messages_sent = messages_sent_out.activate();
+                let mut messages_received = messages_received_out.activate();
 
                 input.for_each(|time, data| {
                     data.swap(&mut demux_buffer);
@@ -80,6 +83,8 @@ pub fn construct<A: Allocate>(
                     let mut channels_session = channels.session(&time);
                     let mut addresses_session = addresses.session(&time);
                     let mut parks_sesssion = parks.session(&time);
+                    let mut messages_sent_session = messages_sent.session(&time);
+                    let mut messages_received_session = messages_received.session(&time);
 
                     for (time, worker, datum) in demux_buffer.drain(..) {
                         let time_ns = time.as_nanos();
@@ -98,18 +103,9 @@ pub fn construct<A: Allocate>(
                                     1,
                                 ));
 
-                                for (addr_slot, addr_value) in event.addr.iter().enumerate() {
-                                    addresses_session.give((
-                                        row_packer.pack(&[
-                                            Datum::Int64(event.id as i64),
-                                            Datum::Int64(worker as i64),
-                                            Datum::Int64(addr_slot as i64),
-                                            Datum::Int64(*addr_value as i64),
-                                        ]),
-                                        time_ms,
-                                        1,
-                                    ));
-                                }
+                                let address_row =
+                                    create_address_row(event.id as i64, worker as i64, &event.addr);
+                                addresses_session.give((address_row, time_ms, 1));
                             }
                             TimelyEvent::Channels(event) => {
                                 // Record channel information so that we can replay a negated
@@ -121,31 +117,23 @@ pub fn construct<A: Allocate>(
 
                                 // Present channel description.
                                 channels_session.give((
-                                    row_packer.pack(&[
-                                        Datum::Int64(event.id as i64),
-                                        Datum::Int64(worker as i64),
-                                        Datum::Int64(event.source.0 as i64),
-                                        Datum::Int64(event.source.1 as i64),
-                                        Datum::Int64(event.target.0 as i64),
-                                        Datum::Int64(event.target.1 as i64),
-                                    ]),
+                                    (
+                                        (event.id, worker),
+                                        event.source.0,
+                                        event.source.1,
+                                        event.target.0,
+                                        event.target.1,
+                                    ),
                                     time_ms,
                                     1,
                                 ));
 
-                                // Enumerate the address of the scope containing the channel.
-                                for (addr_slot, addr_value) in event.scope_addr.iter().enumerate() {
-                                    addresses_session.give((
-                                        row_packer.pack(&[
-                                            Datum::Int64(event.id as i64),
-                                            Datum::Int64(worker as i64),
-                                            Datum::Int64(addr_slot as i64),
-                                            Datum::Int64(*addr_value as i64),
-                                        ]),
-                                        time_ms,
-                                        1,
-                                    ));
-                                }
+                                let address_row = create_address_row(
+                                    event.id as i64,
+                                    worker as i64,
+                                    &event.scope_addr,
+                                );
+                                addresses_session.give((address_row, time_ms, 1));
                             }
                             TimelyEvent::Shutdown(event) => {
                                 // Dropped operators should result in a negative record for
@@ -158,18 +146,13 @@ pub fn construct<A: Allocate>(
                                         -1,
                                     ));
 
-                                    for (addr_slot, addr_value) in event.addr.iter().enumerate() {
-                                        addresses_session.give((
-                                            row_packer.pack(&[
-                                                Datum::Int64(event.id as i64),
-                                                Datum::Int64(worker as i64),
-                                                Datum::Int64(addr_slot as i64),
-                                                Datum::Int64(*addr_value as i64),
-                                            ]),
-                                            time_ms,
-                                            -1,
-                                        ));
-                                    }
+                                    let address_row = create_address_row(
+                                        event.id as i64,
+                                        worker as i64,
+                                        &event.addr,
+                                    );
+                                    addresses_session.give((address_row, time_ms, -1));
+
                                     // If we are observing a dataflow shutdown, we should also
                                     // issue a deletion for channels in the dataflow.
                                     if event.addr.len() == 1 {
@@ -180,33 +163,23 @@ pub fn construct<A: Allocate>(
                                             for event in events {
                                                 // Retract channel description.
                                                 channels_session.give((
-                                                    row_packer.pack(&[
-                                                        Datum::Int64(event.id as i64),
-                                                        Datum::Int64(worker as i64),
-                                                        Datum::Int64(event.source.0 as i64),
-                                                        Datum::Int64(event.source.1 as i64),
-                                                        Datum::Int64(event.target.0 as i64),
-                                                        Datum::Int64(event.target.1 as i64),
-                                                    ]),
+                                                    (
+                                                        (event.id, worker),
+                                                        event.source.0,
+                                                        event.source.1,
+                                                        event.target.0,
+                                                        event.target.1,
+                                                    ),
                                                     time_ms,
                                                     -1,
                                                 ));
 
-                                                // Enumerate the address of the scope containing the channel.
-                                                for (addr_slot, addr_value) in
-                                                    event.scope_addr.iter().enumerate()
-                                                {
-                                                    addresses_session.give((
-                                                        row_packer.pack(&[
-                                                            Datum::Int64(event.id as i64),
-                                                            Datum::Int64(worker as i64),
-                                                            Datum::Int64(addr_slot as i64),
-                                                            Datum::Int64(*addr_value as i64),
-                                                        ]),
-                                                        time_ms,
-                                                        -1,
-                                                    ));
-                                                }
+                                                let address_row = create_address_row(
+                                                    event.id as i64,
+                                                    worker as i64,
+                                                    &event.scope_addr,
+                                                );
+                                                addresses_session.give((address_row, time_ms, -1));
                                             }
                                         }
                                     }
@@ -231,6 +204,28 @@ pub fn construct<A: Allocate>(
                                     }
                                 }
                             },
+
+                            TimelyEvent::Messages(event) => {
+                                if event.is_send {
+                                    messages_sent_session.give((
+                                        (
+                                            (event.channel, event.source),
+                                            (event.target, event.length),
+                                        ),
+                                        time_ms,
+                                        1,
+                                    ));
+                                } else {
+                                    messages_received_session.give((
+                                        (
+                                            (event.channel, event.target),
+                                            (event.source, event.length),
+                                        ),
+                                        time_ms,
+                                        1,
+                                    ));
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -312,9 +307,8 @@ pub fn construct<A: Allocate>(
             .map(|((key, pow), count)| ((key), (pow, count)));
 
         let elapsed = elapsed.map({
-            let mut row_packer = repr::RowPacker::new();
             move |((id, worker), cnt)| {
-                row_packer.pack(&[
+                Row::pack_slice(&[
                     Datum::Int64(id as i64),
                     Datum::Int64(worker as i64),
                     Datum::Int64(cnt as i64),
@@ -323,9 +317,8 @@ pub fn construct<A: Allocate>(
         });
 
         let histogram = histogram.map({
-            let mut row_packer = repr::RowPacker::new();
             move |((id, worker), (pow, cnt))| {
-                row_packer.pack(&[
+                Row::pack_slice(&[
                     Datum::Int64(id as i64),
                     Datum::Int64(worker as i64),
                     Datum::Int64(pow as i64),
@@ -335,9 +328,8 @@ pub fn construct<A: Allocate>(
         });
 
         let operates = operates.map({
-            let mut row_packer = repr::RowPacker::new();
             move |((id, worker), name)| {
-                row_packer.pack(&[
+                Row::pack_slice(&[
                     Datum::Int64(id as i64),
                     Datum::Int64(worker as i64),
                     Datum::String(&name),
@@ -345,8 +337,8 @@ pub fn construct<A: Allocate>(
             }
         });
 
-        let channels = channels.as_collection();
         let addresses = addresses.as_collection();
+        let channels = channels.as_collection();
 
         let parks = parks
             .map(|(w, d, r, t)| {
@@ -363,9 +355,8 @@ pub fn construct<A: Allocate>(
             .as_collection()
             .count_total()
             .map({
-                let mut row_packer = repr::RowPacker::new();
                 move |((w, d, r), c)| {
-                    row_packer.pack(&[
+                    Row::pack_slice(&[
                         Datum::Int64(w as i64),
                         Datum::Int64(d as i64),
                         r.map(|r| Datum::Int64(r as i64)).unwrap_or(Datum::Null),
@@ -373,6 +364,50 @@ pub fn construct<A: Allocate>(
                     ])
                 }
             });
+
+        use differential_dataflow::operators::Count;
+        let messages_sent = thin_collection(messages_sent.as_collection(), delay, |c| {
+            c.semijoin(&channels.map(|(k, _, _, _, _)| k))
+        })
+        .map(|((channel, source), (target, count))| ((channel, source, target), count))
+        .explode(|(key, count)| Some((key, count as isize)))
+        .count();
+
+        let messages_received = thin_collection(messages_received.as_collection(), delay, |c| {
+            c.semijoin(&channels.map(|(k, _, _, _, _)| k))
+        })
+        .map(|((channel, target), (source, count))| ((channel, source, target), count))
+        .explode(|(key, count)| Some((key, count as isize)))
+        .count();
+
+        let messages = messages_received
+            .join_map(&messages_sent, |&key, &sent, &received| {
+                (key, sent, received)
+            })
+            .map({
+                move |((channel, source, target), sent, received)| {
+                    Row::pack_slice(&[
+                        Datum::Int64(channel as i64),
+                        Datum::Int64(source as i64),
+                        Datum::Int64(target as i64),
+                        Datum::Int64(sent as i64),
+                        Datum::Int64(received as i64),
+                    ])
+                }
+            });
+
+        let channels = channels.map({
+            move |((id, worker), source_node, source_port, target_node, target_port)| {
+                Row::pack_slice(&[
+                    Datum::Int64(id as i64),
+                    Datum::Int64(worker as i64),
+                    Datum::Int64(source_node as i64),
+                    Datum::Int64(source_port as i64),
+                    Datum::Int64(target_node as i64),
+                    Datum::Int64(target_port as i64),
+                ])
+            }
+        });
 
         use differential_dataflow::operators::arrange::arrangement::ArrangeByKey;
 
@@ -384,6 +419,7 @@ pub fn construct<A: Allocate>(
             (LogVariant::Timely(TimelyLog::Histogram), histogram),
             (LogVariant::Timely(TimelyLog::Addresses), addresses),
             (LogVariant::Timely(TimelyLog::Parks), parks),
+            (LogVariant::Timely(TimelyLog::Messages), messages),
         ];
 
         let mut result = std::collections::HashMap::new();
@@ -393,11 +429,11 @@ pub fn construct<A: Allocate>(
                 let key_clone = key.clone();
                 let trace = collection
                     .map({
-                        let mut row_packer = repr::RowPacker::new();
+                        let mut row_packer = Row::default();
                         move |row| {
                             let datums = row.unpack();
-                            let key_row = row_packer.pack(key.iter().map(|k| datums[*k]));
-                            (key_row, row)
+                            row_packer.extend(key.iter().map(|k| datums[*k]));
+                            (row_packer.finish_and_reuse(), row)
                         }
                     })
                     .arrange_by_key()
@@ -409,6 +445,25 @@ pub fn construct<A: Allocate>(
     });
 
     traces
+}
+
+fn create_address_row(id: i64, worker: i64, address: &[usize]) -> Row {
+    let id_datum = Datum::Int64(id);
+    let worker_datum = Datum::Int64(worker);
+    // we're collecting into a Vec because we need to iterate over the Datums
+    // twice: once for determining the size of the row, then again for pushing
+    // them
+    let address_datums: Vec<_> = address.iter().map(|i| Datum::Int64(*i as i64)).collect();
+
+    let row_capacity =
+        datum_size(&id_datum) + datum_size(&worker_datum) + datum_list_size(&address_datums);
+
+    let mut address_row = Row::with_capacity(row_capacity);
+    address_row.push(id_datum);
+    address_row.push(worker_datum);
+    address_row.push_list(address_datums);
+
+    address_row
 }
 
 /// Discard all of the records in `c` that `logic` doesn't care about (return).

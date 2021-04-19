@@ -1,11 +1,6 @@
 // Copyright Materialize, Inc. All rights reserved.
 //
-// Use of this software is governed by the Business Source License
-// included in the LICENSE file.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0.
+// Use of this software is governed by the Apache license, Version 2.0
 
 //! Iterator utilities.
 
@@ -129,7 +124,7 @@ where
     ///
     /// Instead of using `PartialOrd::partial_cmp`, this function uses the given `compare`
     /// function to determine the ordering of two elements. Apart from that, it's equivalent to
-    /// [`is_sorted`]; see its documentation for more information.
+    /// [`Iterator::is_sorted`]; see its documentation for more information.
     ///
     /// **Note:** this is a Materialize forward-port of a forthcoming feature
     /// to the standard library.
@@ -146,7 +141,7 @@ where
     /// assert!(![0.0, 1.0, f32::NAN].iter().mz_is_sorted_by(|a, b| a.partial_cmp(b)));
     /// ```
     ///
-    /// [`is_sorted`]: IteratorExt::is_sorted
+    /// [`std::iter::Iterator::is_sorted`]: IteratorExt::is_sorted
     fn mz_is_sorted_by<F>(mut self, mut compare: F) -> bool
     where
         Self: Sized,

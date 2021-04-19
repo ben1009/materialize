@@ -29,20 +29,37 @@ pub struct IngestAction {
     key_format: Option<Format>,
     timestamp: Option<i64>,
     publish: bool,
+    corrupt_keys: bool,
+    corrupt_values: bool,
     rows: Vec<String>,
 }
 
 #[derive(Clone)]
 enum Format {
-    Avro { schema: String },
-    Protobuf { message: protobuf::MessageType },
-    Bytes { terminator: Option<u8> },
+    Avro {
+        schema: String,
+        confluent_wire_format: bool,
+    },
+    Protobuf {
+        message: protobuf::MessageType,
+    },
+    Bytes {
+        terminator: Option<u8>,
+    },
 }
 
 enum Transcoder {
-    Avro { schema: Schema, schema_id: i32 },
-    Protobuf { message: protobuf::MessageType },
-    Bytes { terminator: Option<u8> },
+    Avro {
+        schema: Schema,
+        schema_id: i32,
+        confluent_wire_format: bool,
+    },
+    Protobuf {
+        message: protobuf::MessageType,
+    },
+    Bytes {
+        terminator: Option<u8>,
+    },
 }
 
 impl Transcoder {
@@ -60,23 +77,44 @@ impl Transcoder {
         }
     }
 
-    fn transcode<R>(&self, mut row: R) -> Result<Option<Vec<u8>>, String>
+    /// Take an encoded row and return the results transcoded into the desired format
+    ///
+    /// #Arguments
+    ///
+    /// * `corrupt_buffer`: A boolean flag to determine if the transcoder should
+    ///   corrupt the results in an encoding aware fashion
+    fn transcode<R>(&self, mut row: R, corrupt_buffer: bool) -> Result<Option<Vec<u8>>, String>
     where
         R: BufRead,
     {
         match self {
-            Transcoder::Avro { schema, schema_id } => {
+            Transcoder::Avro {
+                schema,
+                schema_id,
+                confluent_wire_format,
+            } => {
                 if let Some(val) = Self::decode_json(row)? {
                     let val = avro::from_json(&val, schema.top_node())?;
                     let mut out = vec![];
-                    // The first byte is a magic byte (0) that indicates the Confluent
-                    // serialization format version, and the next four bytes are a
-                    // 32-bit schema ID.
-                    //
-                    // https://docs.confluent.io/current/schema-registry/docs/serializer-formatter.html#wire-format
-                    out.write_u8(0).unwrap();
-                    out.write_i32::<NetworkEndian>(*schema_id).unwrap();
+                    if *confluent_wire_format {
+                        // The first byte is a magic byte (0) that indicates the Confluent
+                        // serialization format version, and the next four bytes are a
+                        // 32-bit schema ID.
+                        //
+                        // https://docs.confluent.io/3.3.0/schema-registry/docs/serializer-formatter.html#wire-format
+                        out.write_u8(0).unwrap();
+                        out.write_i32::<NetworkEndian>(*schema_id).unwrap();
+                    }
                     out.extend(avro::to_avro_datum(&schema, val).map_err(|e| e.to_string())?);
+                    if corrupt_buffer {
+                        for x in &mut out {
+                            // We need to corrupt zero-values for Avro, because 0 is always an okay default
+                            *x = match &x {
+                                0 => 1,
+                                _ => *x ^ (*x >> 1),
+                            }
+                        }
+                    }
                     Ok(Some(out))
                 } else {
                     Ok(None)
@@ -101,7 +139,14 @@ impl Transcoder {
                         }
                     }
                 };
-                Ok(Some(val.write_to_bytes().map_err(|e| e.to_string())?))
+                let mut out = val.write_to_bytes().map_err(|e| e.to_string())?;
+                if corrupt_buffer {
+                    for x in &mut out {
+                        // Zero-ing out bytes is sufficient to corrupt Protobuf data
+                        *x = 0;
+                    }
+                }
+                Ok(Some(out))
             }
             Transcoder::Bytes { terminator } => {
                 let mut out = vec![];
@@ -112,6 +157,11 @@ impl Transcoder {
                     }
                     None => {
                         row.read_to_end(&mut out).map_err(|e| e.to_string())?;
+                    }
+                }
+                if corrupt_buffer {
+                    for x in &mut out {
+                        *x = 0;
                     }
                 }
                 Ok(Some(bytes::unescape(&out)?))
@@ -126,6 +176,7 @@ pub fn build_ingest(mut cmd: BuiltinCommand) -> Result<IngestAction, String> {
     let format = match cmd.args.string("format")?.as_str() {
         "avro" => Format::Avro {
             schema: cmd.args.string("schema")?,
+            confluent_wire_format: cmd.args.opt_bool("confluent-wire-format")?.unwrap_or(true),
         },
         "protobuf" => Format::Protobuf {
             message: cmd.args.parse("message")?,
@@ -136,6 +187,7 @@ pub fn build_ingest(mut cmd: BuiltinCommand) -> Result<IngestAction, String> {
     let key_format = match cmd.args.opt_string("key-format").as_deref() {
         Some("avro") => Some(Format::Avro {
             schema: cmd.args.string("key-schema")?,
+            confluent_wire_format: cmd.args.opt_bool("confluent-wire-format")?.unwrap_or(true),
         }),
         Some("protobuf") => Some(Format::Protobuf {
             message: cmd.args.parse("key-message")?,
@@ -151,7 +203,9 @@ pub fn build_ingest(mut cmd: BuiltinCommand) -> Result<IngestAction, String> {
         None => None,
     };
     let timestamp = cmd.args.opt_parse("timestamp")?;
-    let publish = cmd.args.opt_bool("publish")?;
+    let corrupt_keys = cmd.args.opt_parse("corrupt-keys")?.unwrap_or(false);
+    let corrupt_values = cmd.args.opt_parse("corrupt-values")?.unwrap_or(false);
+    let publish = cmd.args.opt_bool("publish")?.unwrap_or(false);
     cmd.args.done()?;
 
     Ok(IngestAction {
@@ -161,6 +215,8 @@ pub fn build_ingest(mut cmd: BuiltinCommand) -> Result<IngestAction, String> {
         key_format,
         timestamp,
         publish,
+        corrupt_keys,
+        corrupt_values,
         rows: cmd.input,
     })
 }
@@ -197,7 +253,10 @@ impl Action for IngestAction {
         let ccsr_client = &state.ccsr_client;
         let make_transcoder = |format, typ| async move {
             match format {
-                Format::Avro { schema } => {
+                Format::Avro {
+                    schema,
+                    confluent_wire_format,
+                } => {
                     let schema_id = if self.publish {
                         let ccsr_subject = format!("{}-{}", topic_name, typ);
                         let schema_id = ccsr_client
@@ -210,7 +269,11 @@ impl Action for IngestAction {
                     };
                     let schema = avro::parse_schema(&schema)
                         .map_err(|e| format!("parsing avro schema: {}", e))?;
-                    Ok::<_, String>(Transcoder::Avro { schema, schema_id })
+                    Ok::<_, String>(Transcoder::Avro {
+                        schema,
+                        schema_id,
+                        confluent_wire_format,
+                    })
                 }
                 Format::Protobuf { message } => Ok(Transcoder::Protobuf { message }),
                 Format::Bytes { terminator } => Ok(Transcoder::Bytes { terminator }),
@@ -227,9 +290,9 @@ impl Action for IngestAction {
             let mut row = row.as_bytes();
             let key = match &key_transcoder {
                 None => None,
-                Some(kt) => kt.transcode(&mut row)?,
+                Some(kt) => kt.transcode(&mut row, self.corrupt_keys)?,
             };
-            let value = value_transcoder.transcode(&mut row)?;
+            let value = value_transcoder.transcode(&mut row, self.corrupt_values)?;
             let producer = &state.kafka_producer;
             futs.push(async move {
                 let mut record: FutureRecord<_, _> =

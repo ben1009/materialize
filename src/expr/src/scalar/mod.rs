@@ -183,6 +183,27 @@ impl MirScalarExpr {
         f(self);
     }
 
+    /// A generalization of `visit_mut`. The function `pre` runs on a
+    /// `MirScalarExpr` before it runs on any of the child `MirScalarExpr`s.
+    /// The function `post` runs on child `MirScalarExpr`s first before the
+    /// parent. Optionally, `pre` can return which child `MirScalarExpr`s, if
+    /// any, should be visited (default is to visit all children).
+    pub fn visit_mut_pre_post<F1, F2>(&mut self, pre: &mut F1, post: &mut F2)
+    where
+        F1: FnMut(&mut Self) -> Option<Vec<&mut MirScalarExpr>>,
+        F2: FnMut(&mut Self),
+    {
+        let to_visit = pre(self);
+        if let Some(to_visit) = to_visit {
+            for e in to_visit {
+                e.visit_mut_pre_post(pre, post);
+            }
+        } else {
+            self.visit1_mut(|e| e.visit_mut_pre_post(pre, post));
+        }
+        post(self);
+    }
+
     /// Rewrites column indices with their value in `permutation`.
     ///
     /// This method is applicable even when `permutation` is not a
@@ -268,6 +289,8 @@ impl MirScalarExpr {
 
     /// Reduces a complex expression where possible.
     ///
+    /// Also canonicalizes the expression.
+    ///
     /// ```rust
     /// use expr::{BinaryFunc, MirScalarExpr};
     /// use repr::{ColumnType, Datum, RelationType, ScalarType};
@@ -291,6 +314,11 @@ impl MirScalarExpr {
         let eval = |e: &MirScalarExpr| {
             MirScalarExpr::literal(e.eval(&[], temp_storage), e.typ(&relation_type).scalar_type)
         };
+
+        // Canonicalize the structure of the expression
+        self.demorgans();
+        self.undistribute_and();
+
         self.visit_mut(&mut |e| match e {
             MirScalarExpr::Column(_)
             | MirScalarExpr::Literal(_, _)
@@ -307,6 +335,26 @@ impl MirScalarExpr {
                             let expr2 = expr2.take().call_unary(UnaryFunc::IsNull);
                             *e = expr1.call_binary(expr2, BinaryFunc::Or);
                         }
+                    }
+                } else if *func == UnaryFunc::Not {
+                    match &mut **expr {
+                        MirScalarExpr::CallBinary { expr1, expr2, func } => {
+                            // Transforms `NOT(a <op> b)` to `a negate(<op>) b`
+                            // if a negation exists.
+                            if let Some(negated_func) = func.negate() {
+                                *e = MirScalarExpr::CallBinary {
+                                    expr1: Box::new(expr1.take()),
+                                    expr2: Box::new(expr2.take()),
+                                    func: negated_func,
+                                }
+                            }
+                        }
+                        // Two negates cancel each other out.
+                        MirScalarExpr::CallUnary {
+                            expr: inner_expr,
+                            func: UnaryFunc::Not,
+                        } => *e = inner_expr.take(),
+                        _ => {}
                     }
                 }
             }
@@ -453,6 +501,9 @@ impl MirScalarExpr {
                         *e = expr2.take();
                     } else if expr1 == expr2 {
                         *e = expr1.take();
+                    } else if expr2 < expr1 {
+                        // Canonically order elements so that deduplication works better.
+                        ::std::mem::swap(expr1, expr2);
                     }
                 } else if *func == BinaryFunc::Or {
                     // If we are here, not both inputs are literals.
@@ -462,6 +513,14 @@ impl MirScalarExpr {
                         *e = expr2.take();
                     } else if expr1 == expr2 {
                         *e = expr1.take();
+                    } else if expr2 < expr1 {
+                        // Canonically order elements so that deduplication works better.
+                        ::std::mem::swap(expr1, expr2);
+                    }
+                } else if *func == BinaryFunc::Eq {
+                    // Canonically order elements so that deduplication works better.
+                    if expr2 < expr1 {
+                        ::std::mem::swap(expr1, expr2);
                     }
                 }
             }
@@ -562,6 +621,134 @@ impl MirScalarExpr {
             }
         });
     }
+
+    /// Transforms !(a && b) into !a || !b and !(a || b) into !a && !b
+    /// TODO: Make this recursive?
+    fn demorgans(&mut self) {
+        if let MirScalarExpr::CallUnary {
+            expr: inner,
+            func: UnaryFunc::Not,
+        } = self
+        {
+            if let MirScalarExpr::CallBinary { expr1, expr2, func } = &mut **inner {
+                match func {
+                    BinaryFunc::And => {
+                        let inner0 = MirScalarExpr::CallUnary {
+                            expr: Box::new(expr1.take()),
+                            func: UnaryFunc::Not,
+                        };
+                        let inner1 = MirScalarExpr::CallUnary {
+                            expr: Box::new(expr2.take()),
+                            func: UnaryFunc::Not,
+                        };
+                        *self = MirScalarExpr::CallBinary {
+                            expr1: Box::new(inner0),
+                            expr2: Box::new(inner1),
+                            func: BinaryFunc::Or,
+                        }
+                    }
+                    BinaryFunc::Or => {
+                        let inner0 = MirScalarExpr::CallUnary {
+                            expr: Box::new(expr1.take()),
+                            func: UnaryFunc::Not,
+                        };
+                        let inner1 = MirScalarExpr::CallUnary {
+                            expr: Box::new(expr2.take()),
+                            func: UnaryFunc::Not,
+                        };
+                        *self = MirScalarExpr::CallBinary {
+                            expr1: Box::new(inner0),
+                            expr2: Box::new(inner1),
+                            func: BinaryFunc::And,
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /* #region `undistribute_and` and helper functions */
+
+    /// Transforms (a && b) || (a && c) into a && (b || c)
+    fn undistribute_and(&mut self) {
+        self.visit_mut(&mut |x| x.undistribute_and_helper());
+    }
+
+    /// AND undistribution to apply at each `ScalarExpr`.
+    fn undistribute_and_helper(&mut self) {
+        if let MirScalarExpr::CallBinary {
+            expr1,
+            expr2,
+            func: BinaryFunc::Or,
+        } = self
+        {
+            let mut ands0 = Vec::new();
+            expr1.harvest_ands(&mut ands0);
+
+            let mut ands1 = Vec::new();
+            expr2.harvest_ands(&mut ands1);
+
+            let mut intersection = Vec::new();
+            for expr in ands0.into_iter() {
+                if ands1.contains(&expr) {
+                    intersection.push(expr);
+                }
+            }
+
+            if !intersection.is_empty() {
+                expr1.suppress_ands(&intersection[..]);
+                expr2.suppress_ands(&intersection[..]);
+            }
+
+            for and_term in intersection.into_iter() {
+                *self = MirScalarExpr::CallBinary {
+                    expr1: Box::new(self.take()),
+                    expr2: Box::new(and_term),
+                    func: BinaryFunc::And,
+                };
+            }
+        }
+    }
+
+    /// Collects undistributable terms from AND expressions.
+    fn harvest_ands(&mut self, ands: &mut Vec<MirScalarExpr>) {
+        if let MirScalarExpr::CallBinary {
+            expr1,
+            expr2,
+            func: BinaryFunc::And,
+        } = self
+        {
+            expr1.harvest_ands(ands);
+            expr2.harvest_ands(ands);
+        } else {
+            ands.push(self.clone())
+        }
+    }
+
+    /// Removes undistributed terms from AND expressions.
+    fn suppress_ands(&mut self, ands: &[MirScalarExpr]) {
+        if let MirScalarExpr::CallBinary {
+            expr1,
+            expr2,
+            func: BinaryFunc::And,
+        } = self
+        {
+            // Suppress the ands in children.
+            expr1.suppress_ands(ands);
+            expr2.suppress_ands(ands);
+
+            // If either argument is in our list, replace it by `true`.
+            let tru = MirScalarExpr::literal_ok(Datum::True, ScalarType::Bool);
+            if ands.contains(expr1) {
+                *self = std::mem::replace(expr2, tru);
+            } else if ands.contains(expr2) {
+                *self = std::mem::replace(expr1, tru);
+            }
+        }
+    }
+
+    /* #endregion */
 
     /// Adds any columns that *must* be non-Null for `self` to be non-Null.
     pub fn non_null_requirements(&self, columns: &mut HashSet<usize>) {
@@ -719,6 +906,10 @@ pub enum EvalError {
         byte_sequence: String,
         encoding_name: String,
     },
+    InvalidJsonbCast {
+        from: String,
+        to: String,
+    },
     InvalidRegex(String),
     InvalidRegexFlag(char),
     InvalidParameterValue(String),
@@ -730,6 +921,9 @@ pub enum EvalError {
     ParseHex(ParseHexError),
     Internal(String),
     InfinityOutOfDomain(String),
+    NegativeOutOfDomain(String),
+    ZeroOutOfDomain(String),
+    MultipleRowsFromSubquery,
 }
 
 impl fmt::Display for EvalError {
@@ -752,6 +946,9 @@ impl fmt::Display for EvalError {
                 c.escape_default()
             ),
             EvalError::InvalidBase64EndSequence => f.write_str("invalid base64 end sequence"),
+            EvalError::InvalidJsonbCast { from, to } => {
+                write!(f, "cannot cast jsonb {} to type {}", from, to)
+            }
             EvalError::InvalidTimezone(tz) => write!(f, "invalid time zone '{}'", tz),
             EvalError::InvalidTimezoneInterval => {
                 f.write_str("timezone interval must not contain months or years")
@@ -789,6 +986,15 @@ impl fmt::Display for EvalError {
             EvalError::Internal(s) => write!(f, "internal error: {}", s),
             EvalError::InfinityOutOfDomain(s) => {
                 write!(f, "function {} is only defined for finite arguments", s)
+            }
+            EvalError::NegativeOutOfDomain(s) => {
+                write!(f, "function {} is not defined for negative numbers", s)
+            }
+            EvalError::ZeroOutOfDomain(s) => {
+                write!(f, "function {} is not defined for zero", s)
+            }
+            EvalError::MultipleRowsFromSubquery => {
+                write!(f, "more than one record produced in subquery")
             }
         }
     }

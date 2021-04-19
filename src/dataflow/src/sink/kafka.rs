@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use differential_dataflow::Collection;
 use lazy_static::lazy_static;
-use log::error;
+use log::{error, info};
 use prometheus::{
     register_int_counter_vec, register_uint_gauge_vec, IntCounter, IntCounterVec, UIntGauge,
     UIntGaugeVec,
@@ -274,8 +274,15 @@ where
         config.set(k, v);
     }
 
-    // TODO(eli): replace with https://github.com/fede1024/rust-rdkafka/pull/333
-    let transactional = connector.config_options.contains_key("transactional.id");
+    let transactional = if connector.exactly_once {
+        // TODO(aljoscha): this only works for now, once there's an actual
+        // Kafka producer on each worker they would step on each others toes
+        let transactional_id = format!("mz-producer-{}", connector.topic);
+        config.set("transactional.id", transactional_id);
+        true
+    } else {
+        false
+    };
 
     let name = format!("kafka-{}", id);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -323,7 +330,7 @@ where
         _,
     >| {
         if s.shutdown_flag.load(Ordering::SeqCst) {
-            error!("shutdown requested for sink: {}", &s.name);
+            info!("shutting down sink: {}", &s.name);
             return false;
         }
 
@@ -337,7 +344,15 @@ where
                     as_of.frontier.less_equal(&time)
                 };
 
-                if !should_emit {
+                let previously_published = match &connector.consistency {
+                    Some(consistency) => match consistency.gate_ts {
+                        Some(gate_ts) => time <= gate_ts,
+                        None => false,
+                    },
+                    None => false,
+                };
+
+                if !should_emit || previously_published {
                     // Skip stale data for already published timestamps
                     continue;
                 }

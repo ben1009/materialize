@@ -52,6 +52,7 @@ list
 map
 numeric
 oid
+rdn
 record
 text
 time
@@ -100,6 +101,7 @@ list             system
 map              system
 numeric          system
 oid              system
+rdn              system
 record           system
 text             system
 time             system
@@ -253,4 +255,4 @@ other_int_map_c     user
 
 > CREATE TYPE jsonb_array_list_c AS LIST (element_type=_jsonb);
 > CREATE TABLE jsonb_array_list_t (a jsonb_array_list_c);
-> INSERT INTO jsonb_array_list_t VALUES (LIST[ARRAY['\{\"1\":2\}'::jsonb]]);
+> INSERT INTO jsonb_array_list_t VALUES (LIST[ARRAY['{"1":2}'::jsonb]]);

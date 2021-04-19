@@ -120,7 +120,7 @@ def docker_images() -> Set[str]:
     """List the Docker images available on the local machine."""
     return set(
         spawn.capture(
-            ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"], unicode=True,
+            ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"], unicode=True
         )
         .strip()
         .split("\n")
@@ -160,6 +160,40 @@ class PreImage:
         return ""
 
 
+class Copy(PreImage):
+    """A `PreImage` action which copies files from a directory.
+
+    The contents of the specified `source` directory are copied into the
+    `destination` directory. The `source` directory is relative to the
+    repository root. The `destination` directory is relative to the mzbuild
+    context. Files in the `source` directory are matched against the glob
+    specified by the `matching` argument.
+    """
+
+    def __init__(self, rd: RepositoryDetails, path: Path, config: Dict[str, Any]):
+        super().__init__(rd, path)
+
+        self.source = config.pop("source", None)
+        if self.source is None:
+            raise ValueError("mzbuild config is missing 'source' argument")
+
+        self.destination = config.pop("destination", None)
+        if self.destination is None:
+            raise ValueError("mzbuild config is missing 'destination' argument")
+
+        self.matching = config.pop("matching", "*")
+
+    def run(self) -> None:
+        super().run()
+        for src in self.inputs():
+            dst = self.path / self.destination / Path(src).relative_to(self.source)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(self.rd.root / src, dst)
+
+    def inputs(self) -> Set[str]:
+        return set(git.expand_globs(self.rd.root, f"{self.source}/{self.matching}"))
+
+
 class CargoPreImage(PreImage):
     """A `PreImage` action that uses Cargo."""
 
@@ -195,9 +229,7 @@ class CargoBuild(CargoPreImage):
         cargo_build = [self.rd.xcargo(), "build", "--bin", self.bin]
         if self.rd.release_mode:
             cargo_build.append("--release")
-        spawn.runv(
-            cargo_build, cwd=self.rd.root,
-        )
+        spawn.runv(cargo_build, cwd=self.rd.root)
         cargo_profile = "release" if self.rd.release_mode else "debug"
         shutil.copy(self.rd.xcargo_target_dir() / cargo_profile / self.bin, self.path)
         if self.strip:
@@ -357,6 +389,8 @@ class Image:
                     self.pre_image = CargoBuild(self.rd, self.path, pre_image)
                 elif typ == "cargo-test":
                     self.pre_image = CargoTest(self.rd, self.path, pre_image)
+                elif typ == "copy":
+                    self.pre_image = Copy(self.rd, self.path, pre_image)
                 else:
                     raise ValueError(
                         f"mzbuild config in {self.path} has unknown pre-image type"
@@ -693,14 +727,14 @@ class Repository:
     def resolve_dependencies(self, targets: Iterable[Image]) -> DependencySet:
         """Compute the dependency set necessary to build target images.
 
-         The dependencies of `targets` will be crawled recursively until the
-         complete set of transitive dependencies is determined or a circular
-         dependency is discovered. The returned dependency set will be sorted
-         in topological order.
+        The dependencies of `targets` will be crawled recursively until the
+        complete set of transitive dependencies is determined or a circular
+        dependency is discovered. The returned dependency set will be sorted
+        in topological order.
 
-         Raises:
-            ValueError: A circular dependency was discovered in the images
-                in the repository.
+        Raises:
+           ValueError: A circular dependency was discovered in the images
+               in the repository.
         """
         resolved = OrderedDict()
         visiting = set()

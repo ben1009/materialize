@@ -33,7 +33,7 @@ mod linear_join;
 use std::collections::HashMap;
 
 use expr::{MapFilterProject, MirScalarExpr};
-use repr::{Datum, Row, RowArena, RowPacker};
+use repr::{Datum, Row, RowArena};
 
 /// A manual closure implementation of filtering and logic application.
 ///
@@ -54,7 +54,6 @@ impl JoinClosure {
         &'a self,
         datums: &mut Vec<Datum<'a>>,
         temp_storage: &'a RowArena,
-        row_packer: &mut RowPacker,
     ) -> Result<Option<Row>, expr::EvalError> {
         for exprs in self.ready_equivalences.iter() {
             // Each list of expressions should be equal to the same value.
@@ -65,7 +64,7 @@ impl JoinClosure {
                 }
             }
         }
-        self.before.evaluate(datums, &temp_storage, row_packer)
+        self.before.evaluate(datums, &temp_storage)
     }
 
     /// Construct an instance of the closure from available columns.
@@ -240,11 +239,7 @@ impl JoinBuildState {
             column_map.insert(column, column_map.len());
         }
         let mut equivalences = equivalences.to_vec();
-        for equivalence in equivalences.iter_mut() {
-            equivalence.sort();
-            equivalence.dedup();
-        }
-        equivalences.sort();
+        expr::canonicalize::canonicalize_equivalences(&mut equivalences);
         Self {
             column_map,
             equivalences,

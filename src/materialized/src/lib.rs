@@ -18,7 +18,7 @@ use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use compile_time_run::run_command_str;
 use futures::StreamExt;
@@ -29,7 +29,7 @@ use tokio::sync::oneshot;
 use tokio_stream::wrappers::TcpListenerStream;
 
 use build_info::BuildInfo;
-use coord::{CacheConfig, LoggingConfig};
+use coord::{CacheConfig, LoggingConfig, PersistenceConfig};
 
 use crate::mux::Mux;
 
@@ -109,12 +109,15 @@ pub struct Config {
     // === Storage options. ===
     /// The directory in which `materialized` should store its own metadata.
     pub data_directory: PathBuf,
+    pub persistence: Option<PersistenceConfig>,
     pub cache: Option<CacheConfig>,
     /// An optional symbiosis endpoint. See the
     /// [`symbiosis`](../symbiosis/index.html) crate for details.
     pub symbiosis_url: Option<String>,
     /// Whether to permit usage of experimental features.
     pub experimental_mode: bool,
+    /// Whether to run in safe mode.
+    pub safe_mode: bool,
     /// An optional telemetry endpoint. Use None to disable telemetry.
     pub telemetry_url: Option<String>,
 }
@@ -142,7 +145,7 @@ pub enum TlsMode {
         /// The path to a TLS certificate authority.
         ca: PathBuf,
     },
-    /// Like [`TlsMode::VerifyCA`], but the `cn` (Common Name) field of the
+    /// Like [`TlsMode::VerifyCa`], but the `cn` (Common Name) field of the
     /// certificate must additionally match the user named in the connection
     /// request.
     VerifyFull {
@@ -159,7 +162,6 @@ pub async fn serve(
     // https://github.com/tokio-rs/tokio/pull/3097.
     runtime: Arc<Runtime>,
 ) -> Result<Server, anyhow::Error> {
-    let start_time = Instant::now();
     let workers = config.workers;
 
     // Validate TLS configuration, if present.
@@ -219,8 +221,10 @@ pub async fn serve(
             data_directory: &config.data_directory,
             timestamp_frequency: config.timestamp_frequency,
             cache: config.cache,
+            persistence: config.persistence,
             logical_compaction_window: config.logical_compaction_window,
             experimental_mode: config.experimental_mode,
+            safe_mode: config.safe_mode,
             build_info: &BUILD_INFO,
         },
         runtime,
@@ -235,23 +239,26 @@ pub async fn serve(
     // should be rejected. Once all existing user connections have gracefully
     // terminated, this task exits.
     let (drain_trigger, drain_tripwire) = oneshot::channel();
-    tokio::spawn(async move {
-        // TODO(benesch): replace with `listener.incoming()` if that is
-        // restored when the `Stream` trait stabilizes.
-        let mut incoming = TcpListenerStream::new(listener);
+    tokio::spawn({
+        let start_time = coord_handle.start_instant();
+        async move {
+            // TODO(benesch): replace with `listener.incoming()` if that is
+            // restored when the `Stream` trait stabilizes.
+            let mut incoming = TcpListenerStream::new(listener);
 
-        let mut mux = Mux::new();
-        mux.add_handler(pgwire::Server::new(pgwire::Config {
-            tls: pgwire_tls,
-            coord_client: coord_client.clone(),
-        }));
-        mux.add_handler(http::Server::new(http::Config {
-            tls: http_tls,
-            coord_client,
-            start_time,
-        }));
-        mux.serve(incoming.by_ref().take_until(drain_tripwire))
-            .await;
+            let mut mux = Mux::new();
+            mux.add_handler(pgwire::Server::new(pgwire::Config {
+                tls: pgwire_tls,
+                coord_client: coord_client.clone(),
+            }));
+            mux.add_handler(http::Server::new(http::Config {
+                tls: http_tls,
+                coord_client,
+                start_time,
+            }));
+            mux.serve(incoming.by_ref().take_until(drain_tripwire))
+                .await;
+        }
     });
 
     // Start a task that checks for the latest version and prints a warning if
@@ -259,8 +266,9 @@ pub async fn serve(
     if let Some(telemetry_url) = config.telemetry_url {
         tokio::spawn(version_check::check_version_loop(
             telemetry_url,
-            coord_handle.cluster_id().to_string(),
-            start_time,
+            coord_handle.cluster_id(),
+            coord_handle.session_id(),
+            coord_handle.start_instant(),
         ));
     }
 

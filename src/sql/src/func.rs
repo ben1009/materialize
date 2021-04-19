@@ -76,7 +76,7 @@ pub enum TypeCategory {
 
 impl TypeCategory {
     /// Extracted from PostgreSQL 9.6.
-    /// ```ignore
+    /// ```sql,ignore
     /// SELECT array_agg(typname), typcategory
     /// FROM pg_catalog.pg_type
     /// WHERE typname IN (
@@ -100,6 +100,7 @@ impl TypeCategory {
             | ScalarType::Float64
             | ScalarType::Int32
             | ScalarType::Int64
+            | ScalarType::Numeric { .. }
             | ScalarType::Oid => Self::Numeric,
             ScalarType::Interval => Self::Timespan,
             ScalarType::List { .. } => Self::List,
@@ -722,21 +723,21 @@ pub enum ParamType {
     /// to exactly match arguments of decimal type.
     DecimalAny,
     /// A polymorphic pseudotype permitting any array type.  For more details,
-    /// see [`resolve_polymorphic_types`].
+    /// see [`ParamList::resolve_polymorphic_types`].
     ArrayAny,
     /// A polymorphic pseudotype permitting a `ScalarType::List` of any element
-    /// type.  For more details, see [`resolve_polymorphic_types`].
+    /// type.  For more details, see [`ParamList::resolve_polymorphic_types`].
     ListAny,
     /// A polymorphic pseudotype permitting all types, with more constraints
     /// than `Any`, i.e. it is subject to polymorphic constraints. For more
-    /// details, see [`resolve_polymorphic_types`].
+    /// details, see [`ParamList::resolve_polymorphic_types`].
     ListElementAny,
     /// A polymorphic pseudotype with the same behavior as `ListElementAny`,
     /// except it does not permit either `ScalarType::Array` or
     /// `ScalarType::List`.
     NonVecAny,
     /// A polymorphic pseudotype permitting a `ScalarType::Map` of any non-nested
-    /// value type. For more details, see [`resolve_polymorphic_types`].
+    /// value type. For more details, see [`ParamList::resolve_polymorphic_types`].
     MapAny,
     /// A standard parameter that accepts arguments that match its embedded
     /// `ScalarType`.
@@ -751,7 +752,7 @@ impl ParamType {
 
         match self {
             ArrayAny => matches!(t, Array(..)),
-            ListAny => matches!(t, List{..}),
+            ListAny => matches!(t, List { .. }),
             Any | ListElementAny => true,
             NonVecAny => !t.is_vec(),
             MapAny => matches!(t, Map { .. }),
@@ -1027,7 +1028,6 @@ fn find_match<'a, R: std::fmt::Debug>(
 
     for (i, arg_type) in types.iter().enumerate() {
         let mut selected_category: Option<TypeCategory> = None;
-        let mut found_string_candidate = false;
         let mut categories_match = true;
 
         match arg_type {
@@ -1037,20 +1037,20 @@ fn find_match<'a, R: std::fmt::Debug>(
             None => {
                 for c in candidates.iter() {
                     let this_category = TypeCategory::from_param(&c.fimpl.params[i]);
+                    // 4.e. cont: Select the string category if any candidate
+                    // accepts that category. (This bias towards string is
+                    // appropriate since an unknown-type literal looks like a
+                    // string.)
+                    if this_category == TypeCategory::String {
+                        selected_category = Some(TypeCategory::String);
+                        break;
+                    }
                     match selected_category {
                         Some(ref mut selected_category) => {
-                            // 4.e. cont: ...if all the remaining candidates
+                            // 4.e. cont: [...otherwise,] if all the remaining candidates
                             // accept the same type category, select that category.
                             categories_match =
                                 selected_category == &this_category && categories_match;
-                            // 4.e. cont: [except for...] select the string
-                            // category if any candidate accepts that category.
-                            // (This bias towards string is appropriate since an
-                            // unknown-type literal looks like a string.)
-                            if this_category == TypeCategory::String {
-                                *selected_category = TypeCategory::String;
-                                found_string_candidate = true;
-                            }
                         }
                         None => selected_category = Some(this_category.clone()),
                     }
@@ -1059,7 +1059,7 @@ fn find_match<'a, R: std::fmt::Debug>(
                 // 4.e. cont: Otherwise fail because the correct choice cannot
                 // be deduced without more clues.
                 // (ed: this doesn't mean fail entirely, simply moving onto 4.f)
-                if !found_string_candidate && !categories_match {
+                if selected_category != Some(TypeCategory::String) && !categories_match {
                     break;
                 }
 
@@ -1397,6 +1397,13 @@ lazy_static! {
                 params!(String, String) => BinaryFunc::DigestString, 44154;
                 params!(Bytes, String) => BinaryFunc::DigestBytes, 44155;
             },
+            "exp" => Scalar {
+                params!(Float64) => UnaryFunc::Exp, 1346;
+                params!(DecimalAny) => Operation::unary(|ecx, e| {
+                    let (_, s) = ecx.scalar_type(&e).unwrap_decimal_parts();
+                    Ok(e.call_unary(UnaryFunc::ExpDecimal(s)))
+                }), 1732;
+            },
             "floor" => Scalar {
                 params!(Float32) => UnaryFunc::FloorFloat32, oid::FUNC_FLOOR_F32_OID;
                 params!(Float64) => UnaryFunc::FloorFloat64, 2309;
@@ -1457,6 +1464,31 @@ lazy_static! {
                 params!(String) => UnaryFunc::CharLength, 1317;
                 params!(Bytes, String) => BinaryFunc::EncodedBytesCharLength, 1713;
             },
+            "ln" => Scalar {
+                params!(Float64) => UnaryFunc::Ln, 1341;
+                params!(DecimalAny) => Operation::unary(|ecx, e| {
+                    let (_, s) = ecx.scalar_type(&e).unwrap_decimal_parts();
+                    Ok(e.call_unary(UnaryFunc::LnDecimal(s)))
+                }), 1734;
+            },
+            "log10" => Scalar {
+                params!(Float64) => UnaryFunc::Log10, 1194;
+                params!(DecimalAny) => Operation::unary(|ecx, e| {
+                    let (_, s) = ecx.scalar_type(&e).unwrap_decimal_parts();
+                    Ok(e.call_unary(UnaryFunc::Log10Decimal(s)))
+                }), 1481;
+            },
+            "log" => Scalar {
+                params!(Float64) => UnaryFunc::Log10, 1340;
+                params!(DecimalAny) => Operation::unary(|ecx, e| {
+                    let (_, s) = ecx.scalar_type(&e).unwrap_decimal_parts();
+                    Ok(e.call_unary(UnaryFunc::Log10Decimal(s)))
+                }), 1340;
+                params!(DecimalAny, DecimalAny) => Operation::binary(|ecx, lhs, rhs| {
+                    let (_, s) = ecx.scalar_type(&lhs).unwrap_decimal_parts();
+                    Ok(lhs.call_binary(rhs, BinaryFunc::LogDecimal(s)))
+                }), 1736;
+            },
             "lower" => Scalar {
                 params!(String) => UnaryFunc::Lower, 870;
             },
@@ -1499,6 +1531,9 @@ lazy_static! {
             "pg_get_userbyid" => Scalar {
                 params!(Oid) => sql_op!("'unknown (OID=' || $1 || ')'"), 1642;
             },
+            "pg_postmaster_start_time" => Scalar {
+                params!() => Operation::nullary(pg_postmaster_start_time), 2560;
+            },
             "pg_table_is_visible" => Scalar {
                 params!(Oid) => sql_op!(
                     "(SELECT s.name = ANY(current_schemas(true))
@@ -1526,12 +1561,28 @@ lazy_static! {
                     Ok(HirScalarExpr::literal(Datum::String(&name), ScalarType::String))
                 }), 1619;
             },
+            "position" => Scalar {
+                params!(String, String) => BinaryFunc::Position, 849;
+            },
+            "power" => Scalar {
+                params!(Float64, Float64) => BinaryFunc::Power, 1368;
+                params!(DecimalAny, DecimalAny) => Operation::binary(|ecx, lhs, rhs| {
+                    let (_, s) = ecx.scalar_type(&lhs).unwrap_decimal_parts();
+                    Ok(lhs.call_binary(rhs, BinaryFunc::PowerDecimal(s)))
+                }), 2169;
+            },
+            "repeat" => Scalar {
+                params!(String, Int32) => BinaryFunc::RepeatString, 1622;
+            },
             "regexp_match" => Scalar {
                 params!(String, String) => VariadicFunc::RegexpMatch, 3396;
                 params!(String, String, String) => VariadicFunc::RegexpMatch, 3397;
             },
             "replace" => Scalar {
                 params!(String, String, String) => VariadicFunc::Replace, 2087;
+            },
+            "right" => Scalar {
+                params!(String, Int32) => BinaryFunc::Right, 3061;
             },
             "round" => Scalar {
                 params!(Float32) => UnaryFunc::RoundFloat32, oid::FUNC_ROUND_F32_OID;
@@ -1724,6 +1775,19 @@ lazy_static! {
                     Ok((e, AggregateFunc::JsonbAgg))
                 }), 3267;
             },
+            "jsonb_object_agg" => Aggregate {
+                params!(Any, Any) => Operation::binary(|ecx, key, val| {
+                    let key = typeconv::to_string(ecx, key);
+                    let val = typeconv::to_jsonb(ecx, val);
+                    let e = HirScalarExpr::CallVariadic {
+                        func: VariadicFunc::RecordCreate {
+                            field_names: vec![ColumnName::from("key"), ColumnName::from("val")],
+                        },
+                        exprs: vec![key, val],
+                    };
+                    Ok((e, AggregateFunc::JsonbObjectAgg))
+                }), 3267;
+            },
             "string_agg" => Aggregate {
                 params!(Any, String) => Operation::binary(|_ecx, _lhs, _rhs| unsupported!("string_agg")), 3538;
             },
@@ -1896,11 +1960,17 @@ lazy_static! {
             "mz_logical_timestamp" => Scalar {
                 params!() => NullaryFunc::MzLogicalTimestamp, oid::FUNC_MZ_LOGICAL_TIMESTAMP_OID;
             },
+            "mz_uptime" => Scalar {
+                params!() => Operation::nullary(mz_uptime), oid::FUNC_MZ_UPTIME_OID;
+            },
             "mz_version" => Scalar {
                 params!() => Operation::nullary(|ecx| {
                     let version = ecx.catalog().config().build_info.human_version();
                     Ok(HirScalarExpr::literal(Datum::String(&version), ScalarType::String))
                 }), oid::FUNC_MZ_VERSION_OID;
+            },
+            "mz_workers" => Scalar {
+                params!() => Operation::nullary(mz_workers), oid::FUNC_MZ_WORKERS_OID;
             },
             "regexp_extract" => Table {
                 params!(String, String) => Operation::binary(move |_ecx, regex, haystack| {
@@ -1922,9 +1992,9 @@ lazy_static! {
                     })
                 }), oid::FUNC_REGEXP_EXTRACT_OID;
             },
-            "repeat" => Table {
+            "repeat_row" => Table {
                 params!(Int64) => Operation::unary(move |ecx, n| {
-                    ecx.require_experimental_mode("repeat")?;
+                    ecx.require_experimental_mode("repeat_row")?;
                     Ok(TableFuncPlan {
                         func: TableFunc::Repeat,
                         exprs: vec![n],
@@ -1995,6 +2065,15 @@ lazy_static! {
             },
             "mz_render_typemod" => Scalar {
                 params!(Oid, Int32) => BinaryFunc::MzRenderTypemod, oid::FUNC_MZ_RENDER_TYPEMOD_OID;
+            },
+            // This ought to be exposed in `mz_catalog`, but its name is rather
+            // confusing. It does not identify the SQL session, but the
+            // invocation of this `materialized` process.
+            "mz_session_id" => Scalar {
+                params!() => Operation::nullary(mz_session_id), oid::FUNC_MZ_SESSION_ID_OID;
+            },
+            "mz_sleep" => Scalar {
+                params!(Float64) => UnaryFunc::Sleep, oid::FUNC_MZ_SLEEP_OID;
             }
         }
     };
@@ -2014,6 +2093,39 @@ fn mz_cluster_id(ecx: &ExprContext) -> Result<HirScalarExpr, anyhow::Error> {
     Ok(HirScalarExpr::literal(
         Datum::from(ecx.catalog().config().cluster_id),
         ScalarType::Uuid,
+    ))
+}
+
+fn mz_session_id(ecx: &ExprContext) -> Result<HirScalarExpr, anyhow::Error> {
+    Ok(HirScalarExpr::literal(
+        Datum::from(ecx.catalog().config().session_id),
+        ScalarType::Uuid,
+    ))
+}
+
+fn mz_workers(ecx: &ExprContext) -> Result<HirScalarExpr, anyhow::Error> {
+    Ok(HirScalarExpr::literal(
+        Datum::from(i64::try_from(ecx.catalog().config().num_workers)?),
+        ScalarType::Int64,
+    ))
+}
+
+fn mz_uptime(ecx: &ExprContext) -> Result<HirScalarExpr, anyhow::Error> {
+    match ecx.qcx.lifetime {
+        QueryLifetime::OneShot => Ok(HirScalarExpr::literal(
+            Datum::from(chrono::Duration::from_std(
+                ecx.catalog().config().start_instant.elapsed(),
+            )?),
+            ScalarType::Interval,
+        )),
+        QueryLifetime::Static => bail!("mz_uptime cannot be used in static queries"),
+    }
+}
+
+fn pg_postmaster_start_time(ecx: &ExprContext) -> Result<HirScalarExpr, anyhow::Error> {
+    Ok(HirScalarExpr::literal(
+        Datum::from(ecx.catalog().config().start_time),
+        ScalarType::TimestampTz,
     ))
 }
 
@@ -2097,6 +2209,7 @@ lazy_static! {
                 params!(Interval, Time) => {
                     Operation::binary(|_ecx, lhs, rhs| Ok(rhs.call_binary(lhs, AddTimeInterval)))
                 }, 1849;
+                params!(Numeric{scale: None}, Numeric{scale: None}) => AddNumeric, 17580;
             },
             "-" => Scalar {
                 params!(Int32) => UnaryFunc::NegInt32, 558;
@@ -2165,6 +2278,7 @@ lazy_static! {
                     let expr = lhs.call_binary(rhs, DivDecimal);
                     Ok(rescale_decimal(expr, si - s2, s))
                 }), 1761;
+                params!(Numeric{scale: None}, Numeric{scale: None}) => DivNumeric, 17610;
             },
             "%" => Scalar {
                 params!(Int32, Int32) => ModInt32, 530;

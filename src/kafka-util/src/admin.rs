@@ -19,7 +19,7 @@ use rdkafka::client::ClientContext;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 
 use ore::collections::CollectionExt;
-use ore::retry;
+use ore::retry::Retry;
 
 /// Creates a Kafka topic and waits for it to be reported in the broker
 /// metadata.
@@ -31,7 +31,7 @@ use ore::retry;
 /// creation can result in "unknown topic" errors.
 ///
 /// This function does not return successfully unless it can find the metadata
-/// for the newly-created topic in a call to [`Client::fetch_metadata`] and
+/// for the newly-created topic in a call to [`rdkafka::client::Client::fetch_metadata`] and
 /// verify that the metadata reports the topic has the number of partitions
 /// requested in `new_topic`. Empirically, this seems to be the condition that
 /// guarantees that future attempts to consume from or produce to the topic will
@@ -59,29 +59,30 @@ where
     // we might produce a message (below) that causes it to get automatically
     // created with the default number partitions, and not the number of
     // partitions requested in `new_topic`.
-    retry::retry_for(Duration::from_secs(8), |_| async {
-        let metadata = client
-            .inner()
-            // N.B. It is extremely important not to ask specifically
-            // about the topic here, even though the API supports it!
-            // Asking about the topic will create it automatically...
-            // with the wrong number of partitions. Yes, this is
-            // unbelievably horrible.
-            .fetch_metadata(None, Some(Duration::from_secs(1)))?;
-        let topic = metadata
-            .topics()
-            .iter()
-            .find(|t| t.name() == new_topic.name)
-            .ok_or(CreateTopicError::MissingMetadata)?;
-        if topic.partitions().len() as i32 != new_topic.num_partitions {
-            return Err(CreateTopicError::PartitionCountMismatch {
-                expected: new_topic.num_partitions,
-                actual: topic.partitions().len() as i32,
-            });
-        }
-        Ok(())
-    })
-    .await
+    Retry::default()
+        .retry(|_| async {
+            let metadata = client
+                .inner()
+                // N.B. It is extremely important not to ask specifically
+                // about the topic here, even though the API supports it!
+                // Asking about the topic will create it automatically...
+                // with the wrong number of partitions. Yes, this is
+                // unbelievably horrible.
+                .fetch_metadata(None, Some(Duration::from_secs(1)))?;
+            let topic = metadata
+                .topics()
+                .iter()
+                .find(|t| t.name() == new_topic.name)
+                .ok_or(CreateTopicError::MissingMetadata)?;
+            if topic.partitions().len() as i32 != new_topic.num_partitions {
+                return Err(CreateTopicError::PartitionCountMismatch {
+                    expected: new_topic.num_partitions,
+                    actual: topic.partitions().len() as i32,
+                });
+            }
+            Ok(())
+        })
+        .await
 }
 
 /// An error while creating a Kafka topic.

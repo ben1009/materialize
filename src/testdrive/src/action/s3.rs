@@ -7,32 +7,38 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use std::cmp;
 use std::collections::HashMap;
-use std::default::Default;
+use std::io::Write;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use rusoto_core::RusotoError;
+use flate2::write::GzEncoder;
+use flate2::Compression as Flate2Compression;
+use rusoto_core::{ByteStream, RusotoError};
 use rusoto_s3::{
     CreateBucketConfiguration, CreateBucketError, CreateBucketRequest,
     GetBucketNotificationConfigurationRequest, PutBucketNotificationConfigurationRequest,
     PutObjectRequest, QueueConfiguration, S3,
 };
 use rusoto_sqs::{
-    CreateQueueError, CreateQueueRequest, GetQueueAttributesRequest, GetQueueUrlRequest,
-    SetQueueAttributesRequest, Sqs,
+    CreateQueueError, CreateQueueRequest, DeleteMessageBatchRequest,
+    DeleteMessageBatchRequestEntry, GetQueueAttributesRequest, GetQueueUrlRequest,
+    ReceiveMessageRequest, SetQueueAttributesRequest, Sqs,
 };
 
+use crate::action::file::{build_compression, Compression};
 use crate::action::{Action, State};
 use crate::parser::BuiltinCommand;
 
 pub struct CreateBucketAction {
-    bucket: String,
+    bucket_prefix: String,
 }
 
 pub fn build_create_bucket(mut cmd: BuiltinCommand) -> Result<CreateBucketAction, String> {
-    Ok(CreateBucketAction {
-        bucket: cmd.args.string("bucket")?,
-    })
+    let bucket_prefix = format!("testdrive-{}", cmd.args.string("bucket")?);
+    cmd.args.done()?;
+    Ok(CreateBucketAction { bucket_prefix })
 }
 
 #[async_trait]
@@ -42,21 +48,25 @@ impl Action for CreateBucketAction {
     }
 
     async fn redo(&self, state: &mut State) -> Result<(), String> {
-        println!("Creating S3 Bucket {}", self.bucket);
+        let bucket = format!("{}-{}", self.bucket_prefix, state.seed);
+        println!("Creating S3 bucket {}", bucket);
 
         match state
             .s3_client
             .create_bucket(CreateBucketRequest {
-                bucket: self.bucket.clone(),
-                create_bucket_configuration: Some(CreateBucketConfiguration {
-                    location_constraint: Some(state.aws_region.name().to_string()),
-                }),
+                bucket: bucket.clone(),
+                create_bucket_configuration: match state.aws_region.name() {
+                    "us-east-1" => None,
+                    name => Some(CreateBucketConfiguration {
+                        location_constraint: Some(name.to_string()),
+                    }),
+                },
                 ..Default::default()
             })
             .await
         {
             Ok(_) | Err(RusotoError::Service(CreateBucketError::BucketAlreadyOwnedByYou(_))) => {
-                state.s3_buckets_created.insert(self.bucket.clone());
+                state.s3_buckets_created.insert(bucket);
                 Ok(())
             }
             Err(e) => Err(format!("creating bucket: {}", e)),
@@ -65,16 +75,23 @@ impl Action for CreateBucketAction {
 }
 
 pub struct PutObjectAction {
-    bucket: String,
+    bucket_prefix: String,
     key: String,
+    compression: Compression,
     contents: String,
 }
 
 pub fn build_put_object(mut cmd: BuiltinCommand) -> Result<PutObjectAction, String> {
+    let bucket_prefix = format!("testdrive-{}", cmd.args.string("bucket")?);
+    let key = cmd.args.string("key")?;
+    let compression = build_compression(&mut cmd)?;
+    let contents = cmd.input.join("\n");
+    cmd.args.done()?;
     Ok(PutObjectAction {
-        bucket: cmd.args.string("bucket")?,
-        key: cmd.args.string("key")?,
-        contents: cmd.input.join("\n"),
+        bucket_prefix,
+        key,
+        compression,
+        contents,
     })
 }
 
@@ -85,13 +102,33 @@ impl Action for PutObjectAction {
     }
 
     async fn redo(&self, state: &mut State) -> Result<(), String> {
-        println!("Creating S3 Bucket {}", self.bucket);
+        let bucket = format!("{}-{}", self.bucket_prefix, state.seed);
+        println!("Put S3 object {}/{}", bucket, self.key);
+
+        let buffer = self.contents.clone().into_bytes();
+        let contents = match self.compression {
+            Compression::None => Ok(buffer),
+            Compression::Gzip => {
+                let mut encoder = GzEncoder::new(Vec::new(), Flate2Compression::default());
+                encoder
+                    .write_all(buffer.as_ref())
+                    .map_err(|e| format!("error writing bytes to encoder: {}", e))?;
+                encoder
+                    .finish()
+                    .map_err(|e| format!("error compressing contents: {}", e))
+            }
+        }?;
 
         state
             .s3_client
             .put_object(PutObjectRequest {
-                bucket: self.bucket.clone(),
-                body: Some(self.contents.clone().into_bytes().into()),
+                bucket,
+                body: Some(ByteStream::from(contents)),
+                content_type: Some("application/octet-stream".to_string()),
+                content_encoding: match self.compression {
+                    Compression::None => None,
+                    Compression::Gzip => Some("gzip".to_string()),
+                },
                 key: self.key.clone(),
                 ..Default::default()
             })
@@ -102,31 +139,31 @@ impl Action for PutObjectAction {
 }
 
 pub struct AddBucketNotifications {
-    bucket: String,
-    events: Vec<String>,
-
-    queue: String,
-
     bucket_prefix: String,
+    queue_prefix: String,
+    events: Vec<String>,
+    sqs_validation_timeout: Option<Duration>,
 }
 
 pub fn build_add_notifications(mut cmd: BuiltinCommand) -> Result<AddBucketNotifications, String> {
+    let bucket_prefix = format!("testdrive-{}", cmd.args.string("bucket")?);
+    let queue_prefix = format!("testdrive-{}", cmd.args.string("queue")?);
     let events = cmd
         .args
         .opt_string("events")
         .map(|a| a.split(',').map(|s| s.to_string()).collect())
         .unwrap_or_else(|| vec!["s3:ObjectCreated:*".to_string()]);
-
-    let bucket_prefix = cmd
+    let sqs_validation_timeout = cmd
         .args
-        .opt_string("bucket_prefix")
-        .unwrap_or_else(|| "materialize-ci-*".into());
-
+        .opt_string("sqs-validation-timeout")
+        .map(|t| parse_duration::parse(&t).map_err(|e| e.to_string()))
+        .transpose()?;
+    cmd.args.done()?;
     Ok(AddBucketNotifications {
-        bucket: cmd.args.string("bucket")?,
-        events,
-        queue: cmd.args.string("queue")?,
         bucket_prefix,
+        queue_prefix,
+        events,
+        sqs_validation_timeout,
     })
 }
 
@@ -137,10 +174,13 @@ impl Action for AddBucketNotifications {
     }
 
     async fn redo(&self, state: &mut State) -> Result<(), String> {
+        let bucket = format!("{}-{}", self.bucket_prefix, state.seed);
+        let queue = format!("{}-{}", self.queue_prefix, state.seed);
+
         let result = state
             .sqs_client
             .create_queue(CreateQueueRequest {
-                queue_name: self.queue.clone(),
+                queue_name: queue.clone(),
                 ..Default::default()
             })
             .await;
@@ -178,7 +218,7 @@ impl Action for AddBucketNotifications {
                 queue_url: queue_url.clone(),
             })
             .await
-            .map_err(|e| format!("getting queue {} attributes: {}", self.queue, e))?
+            .map_err(|e| format!("getting queue {} attributes: {}", queue, e))?
             .attributes
             .ok_or_else(|| "the result should not be empty".to_string())?
             .remove("QueueArn")
@@ -188,7 +228,7 @@ impl Action for AddBucketNotifications {
         let mut attributes = HashMap::new();
         attributes.insert(
             "Policy".to_string(),
-            allow_s3_policy(&queue_arn, &self.bucket_prefix, &state.aws_account),
+            allow_s3_policy(&queue_arn, &bucket, &state.aws_account),
         );
         state
             .sqs_client
@@ -205,7 +245,7 @@ impl Action for AddBucketNotifications {
         let mut config = state
             .s3_client
             .get_bucket_notification_configuration(GetBucketNotificationConfigurationRequest {
-                bucket: self.bucket.clone(),
+                bucket: bucket.clone(),
                 ..Default::default()
             })
             .await
@@ -224,7 +264,7 @@ impl Action for AddBucketNotifications {
         state
             .s3_client
             .put_bucket_notification_configuration(PutBucketNotificationConfigurationRequest {
-                bucket: self.bucket.clone(),
+                bucket: bucket.clone(),
                 notification_configuration: config,
                 ..Default::default()
             })
@@ -236,11 +276,97 @@ impl Action for AddBucketNotifications {
                 )
             })?;
 
-        Ok(())
+        let sqs_validation_timeout = self
+            .sqs_validation_timeout
+            .unwrap_or_else(|| cmp::max(state.default_timeout, Duration::from_secs(120)));
+
+        // Wait until we are sure that the configuration has taken effect
+        //
+        // AWS doesn't specify anywhere how long it should take for
+        // newly-configured buckets to start generating sqs notifications, so
+        // we continuously put new objects into the bucket and wait for any
+        // message to show up.
+
+        let mut attempts = 0;
+        let mut success = false;
+        print!(
+            "Verifying SQS notification configuration for up to {:?} ",
+            sqs_validation_timeout
+        );
+        let start = Instant::now();
+        while start.elapsed() < sqs_validation_timeout {
+            state
+                .s3_client
+                .put_object(PutObjectRequest {
+                    bucket: bucket.clone(),
+                    body: Some(Vec::new().into()),
+                    key: format!("sqs-test/{}", attempts),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|e| format!("creating object to verify sqs: {}", e))?;
+            attempts += 1;
+
+            let resp = state
+                .sqs_client
+                .receive_message(ReceiveMessageRequest {
+                    queue_url: queue_url.clone(),
+                    wait_time_seconds: Some(1),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|e| format!("reading from sqs for verification: {}", e))?;
+
+            if let Some(ms) = resp.messages {
+                if !ms.is_empty() {
+                    let found_real_message = ms
+                        .iter()
+                        .any(|m| m.body.as_ref().unwrap().contains("ObjectCreated:Put"));
+                    if found_real_message {
+                        success = true;
+                    }
+                    state
+                        .sqs_client
+                        .delete_message_batch(DeleteMessageBatchRequest {
+                            queue_url: queue_url.to_string(),
+                            entries: ms
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, m)| DeleteMessageBatchRequestEntry {
+                                    id: i.to_string(),
+                                    receipt_handle: m.receipt_handle.unwrap(),
+                                })
+                                .collect(),
+                        })
+                        .await
+                        .map_err(|e| format!("Deleting validation messages from sqs: {}", e))?;
+                }
+            }
+            if success {
+                break;
+            }
+
+            print!(".");
+        }
+        if success {
+            println!(
+                " Success! (in {} attempts and {:?})",
+                attempts + 1,
+                start.elapsed()
+            );
+            Ok(())
+        } else {
+            println!(
+                " Error, never got messages (after {} attempts and {:?})",
+                attempts + 1,
+                start.elapsed()
+            );
+            Err("Never got messages on S3 bucket notification queue".to_string())
+        }
     }
 }
 
-fn allow_s3_policy(queue_arn: &str, bucket_prefix: &str, self_account: &str) -> String {
+fn allow_s3_policy(queue_arn: &str, bucket: &str, self_account: &str) -> String {
     format!(
         r#"{{
  "Version": "2012-10-17",
@@ -257,14 +383,14 @@ fn allow_s3_policy(queue_arn: &str, bucket_prefix: &str, self_account: &str) -> 
    ],
    "Resource": "{queue_arn}",
    "Condition": {{
-      "ArnLike": {{ "aws:SourceArn": "arn:aws:s3:*:*:{bucket_prefix}" }},
+      "ArnLike": {{ "aws:SourceArn": "arn:aws:s3:*:*:{bucket}" }},
       "StringEquals": {{ "aws:SourceAccount": "{self_account}" }}
    }}
   }}
  ]
 }}"#,
         queue_arn = queue_arn,
-        bucket_prefix = bucket_prefix,
+        bucket = bucket,
         self_account = self_account
     )
 }

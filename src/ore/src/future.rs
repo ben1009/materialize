@@ -1,11 +1,6 @@
 // Copyright Materialize, Inc. All rights reserved.
 //
-// Use of this software is governed by the Business Source License
-// included in the LICENSE file.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0.
+// Use of this software is governed by the Apache license, Version 2.0
 
 //! Future and stream utilities.
 //!
@@ -56,6 +51,13 @@ pub trait OreFutureExt {
     fn either_c<U, V>(self) -> Either3<U, V, Self>
     where
         Self: Sized;
+
+    /// Wraps a future in a [`SpawnIfCanceled`] future, which will spawn a
+    /// task to poll the inner future to completion if it is dropped.
+    fn spawn_if_canceled(self) -> SpawnIfCanceled<Self::Output>
+    where
+        Self: Future + Send + 'static,
+        Self::Output: Send + 'static;
 }
 
 impl<T> OreFutureExt for T
@@ -80,6 +82,16 @@ where
 
     fn either_c<U, V>(self) -> Either3<U, V, T> {
         Either3::C(self)
+    }
+
+    fn spawn_if_canceled(self) -> SpawnIfCanceled<T::Output>
+    where
+        T: Send + 'static,
+        T::Output: Send + 'static,
+    {
+        SpawnIfCanceled {
+            inner: Some(Box::pin(self)),
+        }
     }
 }
 
@@ -140,6 +152,62 @@ where
     }
 }
 
+/// The future returned by [`OreFutureExt::spawn_if_canceled`].
+pub struct SpawnIfCanceled<T>
+where
+    T: Send + 'static,
+{
+    inner: Option<Pin<Box<dyn Future<Output = T> + Send>>>,
+}
+
+impl<T> Future for SpawnIfCanceled<T>
+where
+    T: Send + 'static,
+{
+    type Output = T;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<T> {
+        match &mut self.inner {
+            None => panic!("SpawnIfCanceled polled after completion"),
+            Some(f) => match f.as_mut().poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(res) => {
+                    self.inner = None;
+                    Poll::Ready(res)
+                }
+            },
+        }
+    }
+}
+
+impl<T> Drop for SpawnIfCanceled<T>
+where
+    T: Send + 'static,
+{
+    fn drop(&mut self) {
+        if let Some(f) = self.inner.take() {
+            tokio::spawn(f);
+        }
+    }
+}
+
+impl<T> fmt::Debug for SpawnIfCanceled<T>
+where
+    T: Send + 'static,
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("SpawnIfCanceled")
+            .field(
+                "inner",
+                match &self.inner {
+                    None => &"None",
+                    Some(_) => &"Some(<future>)",
+                },
+            )
+            .finish()
+    }
+}
+
 /// Extension methods for streams.
 pub trait OreStreamExt: Stream {
     /// Discards all items produced by the stream.
@@ -156,8 +224,8 @@ pub trait OreStreamExt: Stream {
     /// Flattens a stream of streams into one continuous stream, but does not
     /// exhaust each incoming stream before moving on to the next.
     ///
-    /// In other words, this is a combination of [`Stream::flatten`] and
-    /// [`Stream::select`]. The streams may be interleaved in any order, but
+    /// In other words, this is a combination of [`futures::stream::Flatten`] and
+    /// [`futures::stream::select`]. The streams may be interleaved in any order, but
     /// the ordering within one of the underlying streams is preserved.
     fn select_flatten(self) -> SelectFlatten<Self>
     where
@@ -177,7 +245,7 @@ impl<S: Stream> OreStreamExt for S {}
 pub trait OreTryStreamExt: TryStream {
     /// Returns the next element of the stream or EOF.
     ///
-    /// This is like [`Stream::try_next`], but `try_recv` treats EOF as an
+    /// This is like [`futures::stream::TryStreamExt::try_next`], but `try_recv` treats EOF as an
     /// error, and so does not need to wrap the next item in an option type.
     fn try_recv(&mut self) -> TryRecv<'_, Self>
     where
@@ -206,7 +274,7 @@ where
     }
 }
 
-/// The stream returned by [`StreamExt::select_flatten`].
+/// The stream returned by [`OreStreamExt::select_flatten`].
 #[derive(Debug)]
 pub struct SelectFlatten<S>
 where
@@ -297,7 +365,7 @@ where
     })
 }
 
-/// The future returned by [`StreamExt::try_recv`].
+/// The future returned by [`OreTryStreamExt::try_recv`].
 #[derive(Debug)]
 pub struct TryRecv<'a, S>(&'a mut S);
 
@@ -331,7 +399,7 @@ pub trait OreSinkExt<T>: Sink<T> {
         Box::new(self)
     }
 
-    /// Like [`SinkExt::send`], but does not flush the sink after enqueuing
+    /// Like [`futures::sink::SinkExt::send`], but does not flush the sink after enqueuing
     /// `item`.
     fn enqueue(&mut self, item: T) -> Enqueue<Self, T> {
         Enqueue {
@@ -385,7 +453,7 @@ pub fn dev_null<T, E>() -> DevNull<T, E> {
 /// A sink that consumes its input and sends it nowhere.
 ///
 /// Primarily useful as a base sink when folding multiple sinks into one using
-/// [`futures::Sink::fanout`].
+/// [`futures::sink::SinkExt::fanout`].
 #[derive(Debug)]
 pub struct DevNull<T, E>(PhantomData<T>, PhantomData<E>);
 

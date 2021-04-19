@@ -53,7 +53,7 @@ async fn run() -> Result<(), anyhow::Error> {
 
     // Initialize and log test variables.
     let seed: u32 = rand::thread_rng().gen();
-    let stream_name = format!("kinesis-load-test-{}", seed);
+    let stream_name = format!("{}-{}", args.stream_prefix, seed);
 
     // todo: make queries per second configurable. (requires mz_client changes)
     log::info!("Starting kinesis load test with mzd={}:{} \
@@ -63,7 +63,7 @@ async fn run() -> Result<(), anyhow::Error> {
     // Initialize test resources in Kinesis.
     let region: Region = args.aws_region.parse().context("parsing AWS region")?;
     let kinesis_client =
-        aws_util::kinesis::client(aws::ConnectInfo::new(region, None, None, None)?).await?;
+        aws_util::client::kinesis(aws::ConnectInfo::new(region, None, None, None)?).await?;
     let stream_arn =
         kinesis::create_stream(&kinesis_client, &stream_name, args.shard_count).await?;
     log::info!("Created Kinesis stream {}", stream_name);
@@ -139,4 +139,8 @@ pub struct Args {
     /// The number of records to put to the Kinesis stream per second
     #[structopt(long, default_value = "2000")]
     pub records_per_second: u64,
+
+    /// The name of the stream to use, will always have a nonce
+    #[structopt(long, default_value = "testdrive-perf-kinesis")]
+    pub stream_prefix: String,
 }

@@ -34,12 +34,12 @@ services:
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
     volumes:
+      # this is the dir that contains all the individual snapshot directories
       - ${MZ_CHBENCH_SNAPSHOT_DIR}:/snapshot
   materialized:
     mzbuild: materialized
     ports:
      - *materialized
-    init: true
     command:
       - --workers=${MZ_WORKERS:-1}
       # We want this to eventually count up to the size of the largest batch in
@@ -54,6 +54,7 @@ services:
       # You can, for example, add `pgwire=trace` or change `info` to `debug` to
       # get more verbose logs.
       - MZ_LOG=pgwire=debug,info
+      - MZ_DEV=1
   mysql:
     mzbuild: chbench-mysql
     ports:
@@ -98,8 +99,7 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
     volumes:
-      - ${MZ_CHBENCH_SNAPSHOT:-./tmp}/zookeeper-data:/var/lib/zookeeper/data
-      - ${MZ_CHBENCH_SNAPSHOT:-./tmp}/zookeeper-log:/var/lib/zookeeper/log
+      - ${MZ_CHBENCH_SNAPSHOT_ZK_DATA:-zk-data}:/var/lib/zookeeper
   kafka:
     image: confluentinc/cp-enterprise-kafka:5.5.3
     ports:
@@ -122,7 +122,7 @@ services:
       CONFLUENT_METRICS_REPORTER_TOPIC_CREATE: "false"
       KAFKA_JMX_PORT: 9991
     volumes:
-      - ${MZ_CHBENCH_SNAPSHOT:-./tmp}/kafka-data:/var/lib/kafka/data
+      - ${MZ_CHBENCH_SNAPSHOT_KAFKA_DATA:-kafka-data}:/var/lib/kafka/data
   connect:
     image: debezium/connect:1.4
     environment:
@@ -192,11 +192,11 @@ services:
   mzutil:
     mzbuild: mzutil
     volumes:
-      - ${MZ_CHBENCH_SNAPSHOT}:/snapshot
+      - ${MZ_CHBENCH_SNAPSHOT:-mzsnap-data}:/snapshot
   kafka-util:
     mzbuild: kafka-util
     volumes:
-      - ${MZ_CHBENCH_SNAPSHOT}:/snapshot
+      - ${MZ_CHBENCH_SNAPSHOT:-mzsnap-data}:/snapshot
 
   # Metabase
   # We need to ~manually add our `metabase-materialize-driver` to /plugins
@@ -259,7 +259,7 @@ services:
     command: ${PEEKER_CMD:---queries q01,q02,q17}
     volumes:
       - ./peeker-config:/etc/peeker
-      - ${MZ_CHBENCH_SNAPSHOT:-/tmp}:/snapshot
+      - ${MZ_CHBENCH_SNAPSHOT:-mzsnap-data}:/snapshot
   test-correctness:
     # NOTE: we really don't want to include depends_on, it causes dependencies to be restarted
     mzbuild: test-correctness
@@ -278,6 +278,11 @@ volumes:
   grafana:
   prometheus:
   view-snapshots:
+
+  # shared volumes for load tests, but a mounted directories for benchmarks
+  mzsnap-data:
+  kafka-data:
+  zk-data:
 
 mzworkflows:
   ci:
@@ -334,11 +339,21 @@ mzworkflows:
         --only-initialize
         -q loadtest
 
-  # Run a test that populates Kafka with data from chbench for a set amount of time
-  # Once chbench exits, record offsets ingested by Materialize and view states
-  # Leaves the cluster running
-  setup-ingest-benchmark:
+  # After the first timer expires, stop chbench and wait for the data to stabilize
+  # Record offsets ingested by Materialize and the answers to our count(*) views
+  # Stops the load generator and source database but leaves the rest of the cluster running
+  prepare-snapshot:
+    env:
+      # If MZ_CHBENCH_SNAPSHOT is defined, use a sub-directory within the snapshot directory
+      # Otherwise, use a named volume
+      # Docker compose doesn't know how to interpolate using ":+", so the interpolation must be
+      # done here, using mzcompose
+      MZ_CHBENCH_SNAPSHOT_KAFKA_DATA: ${MZ_CHBENCH_SNAPSHOT:-kafka-data}${MZ_CHBENCH_SNAPSHOT:+/kafka-data}
+      MZ_CHBENCH_SNAPSHOT_ZK_DATA: ${MZ_CHBENCH_SNAPSHOT:-zk-data}${MZ_CHBENCH_SNAPSHOT:+/zookeeper}
     steps:
+    - step: run
+      service: peeker
+      command: --write-config /snapshot/config.toml
     - step: workflow
       workflow: bring-up-source-data-mysql
     # start the dashboard before the load data get started so that we have data from
@@ -370,8 +385,15 @@ mzworkflows:
       command: snapshot_view_states.py
 
   # Run a workflow to measure the ingest performance of Materialize. Assumes that the you have
-  # already called setup-ingest-benchmark and the cluster is still running
+  # already called prepare-snapshot and the cluster is still running
   measure-ingest-performance:
+    env:
+      # If MZ_CHBENCH_SNAPSHOT is defined, use a sub-directory within the snapshot directory
+      # Otherwise, use a named volume
+      # Docker compose doesn't know how to interpolate using ":+", so the interpolation must be
+      # done here, using mzcompose
+      MZ_CHBENCH_SNAPSHOT_KAFKA_DATA: ${MZ_CHBENCH_SNAPSHOT:-kafka-data}${MZ_CHBENCH_SNAPSHOT:+/kafka-data}
+      MZ_CHBENCH_SNAPSHOT_ZK_DATA: ${MZ_CHBENCH_SNAPSHOT:-zk-data}${MZ_CHBENCH_SNAPSHOT:+/zookeeper}
     steps:
     - step: restart-services
       services: [materialized]
@@ -379,21 +401,16 @@ mzworkflows:
       service: mzutil
       command: wait_for_view_states.py
 
-  # Run a test that populates Kafka with data from chbench for a set amount of time
-  # After the first timer expires, stop chbench and wait for the data to stabilize
-  # Record offsets ingested by Materialize and the answers to our count(*) views
-  # Take a snapshot of topic schemas and contents
-  generate-snapshot:
-    steps:
-    - step: run
-      service: peeker
-      command: --write-config /snapshot/config.toml
-    - step: workflow
-      workflow: setup-ingest-benchmark
-
   # Run a test that populates Kafka with data from topic snapshots
   # Then run Materialize and measure time until it catches up to snapshotted view state
   setup-replay-benchmark:
+    env:
+      # If MZ_CHBENCH_SNAPSHOT is defined, use a sub-directory within the snapshot directory
+      # Otherwise, use a named volume
+      # Docker compose doesn't know how to interpolate using ":+", so the interpolation must be
+      # done here, using mzcompose
+      MZ_CHBENCH_SNAPSHOT_KAFKA_DATA: ${MZ_CHBENCH_SNAPSHOT:-kafka-data}${MZ_CHBENCH_SNAPSHOT:+/kafka-data}
+      MZ_CHBENCH_SNAPSHOT_ZK_DATA: ${MZ_CHBENCH_SNAPSHOT:-zk-data}${MZ_CHBENCH_SNAPSHOT:+/zookeeper}
     steps:
     # start the dashboard before the load data get started so that we have data from
     # the beginning of time
@@ -402,11 +419,19 @@ mzworkflows:
     - step: start-services
       services: [kafka, schema-registry]
     - step: wait-for-tcp
-      host: schema-registry
-      port: 8081
-    - step: wait-for-tcp
       host: kafka
       port: 9092
+    - step: wait-for-tcp
+      host: schema-registry
+      port: 8081
+      dependencies:
+        # sometimes kafka comes up for awhile and then crashes, which will always cause
+        # schema-registry to fail because there is no kafka cluster
+        - host: kafka
+          port: 9092
+          hint: >-
+            If kafka logs that it has an invalid cluster id ensure that all volumes are
+            destroyed via 'mzcompose down -v'
     - step: start-services
       services: [materialized]
     - step: run
@@ -564,9 +589,6 @@ mzworkflows:
       workflow: bring-up-mysql-kafka
     - step: start-services
       services: [prometheus_sql_exporter_mysql_tpcch]
-    - step: drop-kafka-topics
-      kafka-container: chbench_kafka_1
-      topic_pattern: debezium.tpcch.*
     - step: run
       service: chbench
       command: >-
@@ -608,11 +630,17 @@ mzworkflows:
   bring-up-mysql-kafka:
     steps:
     - step: start-services
-      services: [mysql]
+      services: [mysql, kafka]
     - step: wait-for-mysql
       user: root
       password: rootpw
       timeout_secs: 30
+    - step: wait-for-tcp
+      host: kafka
+      port: 9092
+    - step: drop-kafka-topics
+      kafka-container: chbench_kafka_1
+      topic_pattern: debezium.tpcch.*
     - step: start-services
       services: [connector-mysql]
     - step: wait-for-tcp
@@ -622,9 +650,15 @@ mzworkflows:
     - step: wait-for-tcp
       host: schema-registry
       port: 8081
-    - step: wait-for-tcp
-      host: kafka
-      port: 9092
+      dependencies:
+        # sometimes kafka comes up for awhile and then crashes, which will always cause
+        # schema-registry to fail because there is no kafka cluster
+        - host: kafka
+          port: 9092
+          hint: >-
+            If kafka logs that it has an invalid cluster id ensure that all volumes are
+            destroyed via 'mzcompose down -v'
+
 
   # Brings up everything to run chbench unisolated, i.e. local tests.
   bring-up-source-data-mysql:
@@ -642,9 +676,6 @@ mzworkflows:
     - step: wait-for-tcp
       host: mysql
       port: 3306
-    - step: drop-kafka-topics
-      kafka-container: chbench_kafka_1
-      topic_pattern: debezium.tpcch.*
     - step: run
       service: chbench
       command: >-
@@ -660,10 +691,13 @@ mzworkflows:
   bring-up-postgres-kafka:
     steps:
     - step: start-services
-      services: [postgres]
+      services: [postgres, kafka]
     - step: wait-for-postgres
       dbname: postgres
       timeout_secs: 30
+    - step: drop-kafka-topics
+      kafka-container: chbench_kafka_1
+      topic_pattern: debezium.tpcch.*
     - step: start-services
       services: [connector-postgres]
     - step: wait-for-tcp
@@ -671,11 +705,19 @@ mzworkflows:
       port: 8083
       timeout_secs: 120
     - step: wait-for-tcp
-      host: schema-registry
-      port: 8081
-    - step: wait-for-tcp
       host: kafka
       port: 9092
+    - step: wait-for-tcp
+      host: schema-registry
+      port: 8081
+      dependencies:
+        # sometimes kafka comes up for awhile and then crashes, which will always cause
+        # schema-registry to fail because there is no kafka cluster
+        - host: kafka
+          port: 9092
+          hint: >-
+            If kafka logs that it has an invalid cluster id ensure that all volumes are
+            destroyed via 'mzcompose down -v'
 
   # Brings up everything to run chbench unisolated, i.e. local tests.
   bring-up-source-data-postgres:
@@ -693,9 +735,6 @@ mzworkflows:
     - step: wait-for-tcp
       host: postgres
       port: 5432
-    - step: drop-kafka-topics
-      kafka-container: chbench_kafka_1
-      topic_pattern: debezium.tpcch.*
     - step: run
       service: chbench
       command: >-

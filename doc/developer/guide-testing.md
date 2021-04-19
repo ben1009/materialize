@@ -46,7 +46,7 @@ the following will do the trick if you have the Confluent Platform 5.3+ CLI
 installed and configured:
 
 ```shell
-$ confluent local start schema-registry
+$ confluent local services schema-registry start
 ```
 
 `cargo test` supports many options for precisely controlling what tests get
@@ -271,16 +271,16 @@ Zookeeper, Kafka, the Confluent Schema Registry, and mock versions of AWS S3 and
 `test/testdrive` directory:
 
 ```
-BUILD_MODE=debug TD_TEST=*.td ./mzcompose run testdrive
+TD_TEST=*.td ./mzcompose --mz-build-mode=dev run testdrive
 ```
 
-Supported **environment variables** (in addition to `BUILD_MODE` documented elsewhere):
+Supported **environment variables** (in addition to the `--mz-build-mode` argument documented elsewhere):
 
 * `TD_TEST` (default `*.td`) is a glob of tests to run from the test/testdrive directory. The
   default is to not run any of the "esoteric" tests.
 
   ```
-  TD_TEST=joins.td BUILD_MODE=debug ./mzcompose run testdrive
+  TD_TEST=joins.td ./mzcompose --mz-build-mode=dev run testdrive
   ```
 
 * `AWS_REGION`/`AWS_ENDPOINT`: will be supplied to the testdrive `--aws-region`/`--aws-endpoint`
@@ -374,7 +374,7 @@ will hamper development as often as it catches regressions.
 
 Nikhil's philosophy is that writing a battery of system tests is a much better
 use of time. Testdrive and sqllogictest have discovered numerous bugs with the
-fiddly bits of timestamp assignment in the dataflow package, even though that's
+fiddly bits of timestamp assignment in the coord package, even though that's
 not what they're designed for. It's true that it's much harder to ascertain what
 exactly went wrong–some of these failures presented as hangs in CI—but I wager
 that you still net save time by not writing overly complicated and brittle unit
