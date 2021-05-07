@@ -9,6 +9,13 @@
   [SSL-encrypted](#ssl-encrypted-kafka-details) or
   [Kerberized Kafka clusters](#kerberized-kafka-details).
 
+#### Partition offsets
+
+The `start_offset` option comes with some quirks to be aware of:
+
+- If fewer offsets than partitions are provided, then the remaining partitions will start at offset 0. This is true if the user provides `start_offset=1` or `start_offset=[1, ...]`.
+- If more offsets than partitions are provided, then any partitions added later will incorrectly be read from that offset. So, if you have a single partition, but you provide `start_offset=[1,2]`, when you add the second partition you will miss the first 2 records of data.
+
 #### Cached Kafka sources
 
 To avoid re-reading data from Kafka on restart, Materialize lets you create
@@ -43,7 +50,7 @@ Enable connections to Kerberized Kafka clusters using the appropriate [`WITH`
 options](#kerberos-with-options).
 
 - Materialize currently only supports:
-  - `GSSAPI` as the `sasl_mechanisms`
+  - `GSSAPI` or `PLAIN` as the `sasl_mechanisms`
   - `sasl_plaintext`, `scram-sha-256`, or `scram-sha-512`  as the `security_protocol`
 - Materialize does _not_ support Kerberos authentication for Confluent Schema
   Registries.

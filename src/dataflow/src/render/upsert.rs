@@ -36,8 +36,7 @@ use crate::source::{SourceData, SourceOutput};
 pub fn decode_stream<G>(
     stream: &Stream<G, SourceOutput<Vec<u8>, Vec<u8>>>,
     as_of_frontier: Antichain<Timestamp>,
-    mut key_decoder_state: Box<dyn DecoderState>,
-    mut value_decoder_state: Box<dyn DecoderState>,
+    mut decoder_state: impl DecoderState + 'static,
     operators: &mut Option<LinearOperator>,
     source_arity: usize,
 ) -> (
@@ -119,7 +118,8 @@ where
             .collect::<Vec<_>>();
     }
     let temporal_plan = if !temporal.is_empty() {
-        Some(crate::FilterPlan::create_from(temporal).unwrap_or_else(|e| panic!("{}", e)))
+        let temporal_mfp = expr::MapFilterProject::new(source_arity).filter(temporal);
+        Some(temporal_mfp.into_plan().unwrap_or_else(|e| panic!("{}", e)))
     } else {
         None
     };
@@ -200,20 +200,18 @@ where
                         let mut session = output.session(cap);
                         removed_times.push(time.clone());
                         for (key, data) in map.drain() {
-                            // decode key and value
+                            // decode key and value, and apply predicates/projections to they combined key/value
+                            //
                             // TODO(mcsherry): we could record key decoding errors as the value
                             // which would allow us to recover from key decoding errors by a
                             // later retraction of the key (it will never decode correctly, but
                             // we could produce and then remove the error from the output).
-                            //
-                            // TODO(bwm): migrate upsert to use the same framework for key-value
-                            // decoding as other code, as we build out a design for that.
-                            match key_decoder_state.decode_upsert_value(&key, None, None) {
+                            match decoder_state.decode_key(&key) {
                                 Ok(Some(decoded_key)) => {
                                     let decoded_value = if data.value.is_empty() {
                                         Ok(None)
                                     } else {
-                                        value_decoder_state
+                                        decoder_state
                                             // Start with an attempt to decode the value.
                                             .decode_upsert_value(
                                                 &data.value,
@@ -281,8 +279,7 @@ where
                 for time in removed_times {
                     to_send.remove(&time);
                 }
-                key_decoder_state.log_error_count();
-                value_decoder_state.log_error_count();
+                decoder_state.log_error_count();
             }
         },
     );
@@ -297,11 +294,14 @@ where
         let (oks2, errs2) = oks.flat_map_fallible({
             let mut datums = crate::render::datum_vec::DatumVec::new();
             move |(row, time, diff)| {
+                let arena = repr::RowArena::new();
                 let mut datums_local = datums.borrow_with(&row);
-                let time_diffs = plan.evaluate(&mut datums_local, time, diff);
+                let times_diffs = plan.evaluate(&mut datums_local, &arena, time, diff);
                 // Explicitly drop `datums_local` to release the borrow.
                 drop(datums_local);
-                time_diffs.map(move |time_diff| time_diff.map(|(t, d)| (row.clone(), t, d)))
+                times_diffs.map(move |time_diff| {
+                    time_diff.map_err(|(e, t, d)| (DataflowError::from(e), t, d))
+                })
             }
         });
 

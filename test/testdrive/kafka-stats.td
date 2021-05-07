@@ -89,7 +89,7 @@ partition_id  rx_msgs  rx_bytes  tx_msgs  tx_bytes  lo_offset  hi_offset  ls_off
 0  4  28  0  0  0  4  4  4 0
 
 # Verify that we can join against mz_source_info
-> SELECT mz_kafka_consumer_partitions.rx_msgs FROM mz_kafka_consumer_partitions INNER JOIN mz_source_info USING (source_id, dataflow_id, partition_id) WHERE mz_source_info.source_name like 'kafka-%%';
+> SELECT mz_kafka_consumer_partitions.rx_msgs FROM mz_kafka_consumer_partitions INNER JOIN mz_source_info USING (source_id, dataflow_id, partition_id) WHERE mz_source_info.source_name like 'testdrive-data-%%';
 rx_msgs
 -------
 4
@@ -101,6 +101,16 @@ rx_msgs
 count
 -----
 1
+
+> SELECT value FROM mz_metrics
+  WHERE metric = 'mz_kafka_partition_offset_max' AND labels->>'topic' = 'testdrive-data-${testdrive.seed}'
+  ORDER BY time DESC LIMIT 1
+0
+
+> SELECT value FROM mz_metrics
+  WHERE metric = 'mz_partition_offset_received' AND labels->>'topic' = 'testdrive-data-${testdrive.seed}'
+  ORDER BY time DESC LIMIT 1
+4
 
 # Drop the sources and verify that metrics have been removed
 > DROP VIEW test1

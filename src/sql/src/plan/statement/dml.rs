@@ -30,7 +30,9 @@ use crate::catalog::CatalogItemType;
 use crate::plan::query;
 use crate::plan::query::QueryLifetime;
 use crate::plan::statement::{StatementContext, StatementDesc};
-use crate::plan::{CopyFormat, Params, PeekWhen, Plan};
+use crate::plan::{
+    CopyFormat, ExplainPlan, InsertPlan, Params, PeekPlan, PeekWhen, Plan, TailPlan,
+};
 
 // TODO(benesch): currently, describing a `SELECT` or `INSERT` query
 // plans the whole query to determine its shape and parameter types,
@@ -64,7 +66,7 @@ pub fn plan_insert(
     expr.bind_parameters(&params)?;
     let expr = expr.lower();
 
-    Ok(Plan::Insert { id, values: expr })
+    Ok(Plan::Insert(InsertPlan { id, values: expr }))
 }
 
 pub fn describe_update(
@@ -120,12 +122,12 @@ pub fn plan_select(
         None => PeekWhen::Immediately,
     };
 
-    Ok(Plan::Peek {
+    Ok(Plan::Peek(PeekPlan {
         source: expr,
         when,
         finishing,
         copy_to,
-    })
+    }))
 }
 
 pub fn describe_explain(
@@ -134,27 +136,29 @@ pub fn describe_explain(
         stage, explainee, ..
     }: ExplainStatement<Raw>,
 ) -> Result<StatementDesc, anyhow::Error> {
-    Ok(StatementDesc::new(Some(RelationDesc::empty().with_column(
-        match stage {
-            ExplainStage::RawPlan => "Raw Plan",
-            ExplainStage::DecorrelatedPlan => "Decorrelated Plan",
-            ExplainStage::OptimizedPlan { .. } => "Optimized Plan",
-        },
-        ScalarType::String.nullable(false),
-    )))
-    .with_pgrepr_params(match explainee {
-        Explainee::Query(q) => {
-            describe_select(
-                scx,
-                SelectStatement {
-                    query: q,
-                    as_of: None,
-                },
-            )?
-            .param_types
-        }
-        _ => vec![],
-    }))
+    Ok(
+        StatementDesc::new(Some(RelationDesc::empty().with_named_column(
+            match stage {
+                ExplainStage::RawPlan => "Raw Plan",
+                ExplainStage::DecorrelatedPlan => "Decorrelated Plan",
+                ExplainStage::OptimizedPlan { .. } => "Optimized Plan",
+            },
+            ScalarType::String.nullable(false),
+        )))
+        .with_pgrepr_params(match explainee {
+            Explainee::Query(q) => {
+                describe_select(
+                    scx,
+                    SelectStatement {
+                        query: q,
+                        as_of: None,
+                    },
+                )?
+                .param_types
+            }
+            _ => vec![],
+        }),
+    )
 }
 
 pub fn plan_explain(
@@ -208,13 +212,13 @@ pub fn plan_explain(
     };
     expr.bind_parameters(&params)?;
     let decorrelated_expr = expr.clone().lower();
-    Ok(Plan::ExplainPlan {
+    Ok(Plan::Explain(ExplainPlan {
         raw_plan: expr,
         decorrelated_plan: decorrelated_expr,
         row_set_finishing: finishing,
         stage,
         options,
-    })
+    }))
 }
 
 /// Plans and decorrelates a `Query`. Like `query::plan_root_query`, but returns
@@ -253,17 +257,23 @@ pub fn describe_tail(
 ) -> Result<StatementDesc, anyhow::Error> {
     let sql_object = scx.resolve_item(name)?;
     let options = TailOptions::try_from(options)?;
+    let progress = options.progress.unwrap_or(false);
     const MAX_U64_DIGITS: u8 = 20;
-    let mut desc = RelationDesc::empty().with_column(
+    let mut desc = RelationDesc::empty().with_named_column(
         "timestamp",
         ScalarType::Decimal(MAX_U64_DIGITS, 0).nullable(false),
     );
-    if options.progress.unwrap_or(false) {
-        desc = desc.with_column("progressed", ScalarType::Bool.nullable(false));
+    if progress {
+        desc = desc.with_named_column("progressed", ScalarType::Bool.nullable(false));
     }
-    let desc = desc
-        .with_column("diff", ScalarType::Int64.nullable(true))
-        .concat(sql_object.desc()?.clone());
+    desc = desc.with_named_column("diff", ScalarType::Int64.nullable(true));
+    for (name, ty) in sql_object.desc()?.iter() {
+        let mut ty = ty.clone();
+        if progress {
+            ty.nullable = true;
+        }
+        desc = desc.with_column(name.clone(), ty);
+    }
     Ok(StatementDesc::new(Some(desc)))
 }
 
@@ -283,7 +293,7 @@ pub fn plan_tail(
 
     match entry.item_type() {
         CatalogItemType::Table | CatalogItemType::Source | CatalogItemType::View => {
-            Ok(Plan::Tail {
+            Ok(Plan::Tail(TailPlan {
                 id: entry.id(),
                 ts,
                 with_snapshot: options.snapshot.unwrap_or(true),
@@ -291,7 +301,7 @@ pub fn plan_tail(
                 emit_progress: options.progress.unwrap_or(false),
                 object_columns: entry.desc()?.arity(),
                 desc,
-            })
+            }))
         }
         CatalogItemType::Func
         | CatalogItemType::Index

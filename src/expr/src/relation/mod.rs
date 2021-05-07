@@ -248,8 +248,10 @@ impl MirRelationExpr {
                         }
                     }
                     if rows.len() == 0 || (rows.len() == 1 && rows[0].1 == 1) {
-                        typ.clone().with_key(Vec::new())
+                        RelationType::new(typ.column_types.clone()).with_key(vec![])
                     } else {
+                        // TODO: Have the keys of the constant be the columns
+                        // containing unique values
                         typ.clone()
                     }
                 } else {
@@ -343,7 +345,34 @@ impl MirRelationExpr {
                 let typ = RelationType::new(input_typ.column_types);
                 typ
             }
-            MirRelationExpr::Filter { input, .. } => input.typ(),
+            MirRelationExpr::Filter { input, predicates } => {
+                // A filter inherits the keys of its input unless the filters
+                // have reduced the input to a single row, in which case the
+                // keys of the input are `()`.
+                let mut input_typ = input.typ();
+                let cols_equal_to_literal = predicates
+                    .iter()
+                    .filter_map(|p| {
+                        if let MirScalarExpr::CallBinary {
+                            func: crate::BinaryFunc::Eq,
+                            expr1,
+                            expr2,
+                        } = p
+                        {
+                            if let MirScalarExpr::Column(c) = &**expr1 {
+                                if expr2.is_literal_ok() {
+                                    return Some(c);
+                                }
+                            }
+                        }
+                        None
+                    })
+                    .collect::<Vec<_>>();
+                for key_set in &mut input_typ.keys {
+                    key_set.retain(|k| !cols_equal_to_literal.contains(&k));
+                }
+                input_typ
+            }
             MirRelationExpr::Join {
                 inputs,
                 equivalences,
@@ -468,7 +497,7 @@ impl MirRelationExpr {
                 // If there are A, B, each with a unique `key` such that
                 // we are looking at
                 //
-                //     A + (B - A.proj(key)).map(stuff)
+                //     A.proj(set_containg_key) + (B - A.proj(key)).map(stuff)
                 //
                 // Then we can report `key` as a unique key.
                 //
@@ -478,11 +507,20 @@ impl MirRelationExpr {
                 // subset of B, as otherwise there are negative records
                 // and who knows what is true (not expected, but again
                 // who knows what the query plan might look like).
+
+                let (base_projection, base_with_project_stripped) =
+                    if let MirRelationExpr::Project { input, outputs } = &**base {
+                        (outputs.clone(), &**input)
+                    } else {
+                        // A input without a project is equivalent to an input
+                        // with the project being all columns in the input in order.
+                        ((0..base_cols.len()).collect::<Vec<_>>(), &**base)
+                    };
                 let mut keys = Vec::new();
                 if let MirRelationExpr::Get {
                     id: first_id,
                     typ: _,
-                } = &**base
+                } = base_with_project_stripped
                 {
                     if inputs.len() == 1 {
                         if let MirRelationExpr::Map { input, .. } = &inputs[0] {
@@ -501,6 +539,8 @@ impl MirRelationExpr {
                                                             |key| {
                                                                 key.iter().all(|c| {
                                                                     outputs.get(*c) == Some(c)
+                                                                        && base_projection.get(*c)
+                                                                            == Some(c)
                                                                 })
                                                             },
                                                         ),
@@ -515,11 +555,7 @@ impl MirRelationExpr {
                     }
                 }
 
-                let mut result = RelationType::new(base_cols);
-                for key in keys {
-                    result = result.with_key(key);
-                }
-                result
+                RelationType::new(base_cols).with_keys(keys)
                 // Important: do not inherit keys of either input, as not unique.
             }
             MirRelationExpr::ArrangeBy { input, .. } => input.typ(),
@@ -1128,6 +1164,13 @@ impl MirRelationExpr {
         ViewExplanation::new(self, &DummyHumanizer).to_string()
     }
 
+    /// Pretty-print this MirRelationExpr to a string with type information.
+    pub fn pretty_typed(&self) -> String {
+        let mut explanation = ViewExplanation::new(self, &DummyHumanizer);
+        explanation.explain_types();
+        explanation.to_string()
+    }
+
     /// Take ownership of `self`, leaving an empty `MirRelationExpr::Constant` with the correct type.
     pub fn take_safely(&mut self) -> MirRelationExpr {
         let typ = self.typ();
@@ -1312,6 +1355,35 @@ impl AggregateExpr {
     /// Computes the type of this `AggregateExpr`.
     pub fn typ(&self, relation_type: &RelationType) -> ColumnType {
         self.func.output_type(self.expr.typ(relation_type))
+    }
+
+    /// Returns whether the expression has a constant result.
+    pub fn is_constant(&self) -> bool {
+        match self.func {
+            AggregateFunc::MaxInt32
+            | AggregateFunc::MaxInt64
+            | AggregateFunc::MaxFloat32
+            | AggregateFunc::MaxFloat64
+            | AggregateFunc::MaxDecimal
+            | AggregateFunc::MaxBool
+            | AggregateFunc::MaxString
+            | AggregateFunc::MaxDate
+            | AggregateFunc::MaxTimestamp
+            | AggregateFunc::MaxTimestampTz
+            | AggregateFunc::MinInt32
+            | AggregateFunc::MinInt64
+            | AggregateFunc::MinFloat32
+            | AggregateFunc::MinFloat64
+            | AggregateFunc::MinDecimal
+            | AggregateFunc::MinBool
+            | AggregateFunc::MinString
+            | AggregateFunc::MinDate
+            | AggregateFunc::MinTimestamp
+            | AggregateFunc::MinTimestampTz
+            | AggregateFunc::Any
+            | AggregateFunc::All => self.expr.is_literal(),
+            _ => false,
+        }
     }
 }
 

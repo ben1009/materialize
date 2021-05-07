@@ -27,7 +27,9 @@ use timely::dataflow::{
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use dataflow_types::{Consistency, DataEncoding, ExternalSourceConnector, MzOffset, SourceError};
+use dataflow_types::{
+    Consistency, ExternalSourceConnector, MzOffset, SourceDataEncoding, SourceError,
+};
 use expr::{PartitionId, SourceInstanceId};
 use lazy_static::lazy_static;
 use log::{debug, error, trace};
@@ -81,6 +83,9 @@ static YIELD_INTERVAL_MS: u128 = 10;
 pub struct SourceConfig<'a, G> {
     /// The name to attach to the underlying timely operator.
     pub name: String,
+    /// The name of the upstream resource this source corresponds to
+    /// (For example, a Kafka topic)
+    pub upstream_name: Option<String>,
     /// The ID of this instantiation of this source.
     pub id: SourceInstanceId,
     /// The timely scope in which to build the source.
@@ -101,7 +106,7 @@ pub struct SourceConfig<'a, G> {
     /// Whether this worker has been chosen to actually receive data.
     pub active: bool,
     /// Data encoding
-    pub encoding: DataEncoding,
+    pub encoding: SourceDataEncoding,
     /// Channel to send source caching information to cacher thread
     pub caching_tx: Option<mpsc::UnboundedSender<CacheMessage>>,
     /// Timely worker logger for source events
@@ -284,7 +289,7 @@ pub(crate) trait SourceReader<Out> {
         worker_id: usize,
         consumer_activator: SyncActivator,
         connector: ExternalSourceConnector,
-        encoding: DataEncoding,
+        encoding: SourceDataEncoding,
         logger: Option<Logger>,
     ) -> Result<(Self, Option<PartitionId>), anyhow::Error>
     where
@@ -521,7 +526,7 @@ pub struct ConsistencyInfo {
 impl ConsistencyInfo {
     fn new(
         active: bool,
-        source_name: String,
+        metrics_name: String,
         source_id: SourceInstanceId,
         worker_id: usize,
         worker_count: usize,
@@ -536,7 +541,7 @@ impl ConsistencyInfo {
             partition_metadata: HashMap::new(),
             source_type: consistency,
             source_metrics: SourceMetrics::new(
-                &source_name,
+                &metrics_name,
                 source_id,
                 &worker_id.to_string(),
                 logger,
@@ -1241,6 +1246,7 @@ where
 {
     let SourceConfig {
         name,
+        upstream_name,
         id,
         scope,
         timestamp_histories,
@@ -1261,7 +1267,7 @@ where
         // Create control plane information (Consistency-related information)
         let mut consistency_info = ConsistencyInfo::new(
             active,
-            name.clone(),
+            upstream_name.unwrap_or_else(|| name.clone()),
             id,
             worker_id,
             worker_count,

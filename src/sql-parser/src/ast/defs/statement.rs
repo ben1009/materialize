@@ -18,10 +18,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt;
+
 use crate::ast::display::{self, AstDisplay, AstFormatter};
 use crate::ast::{
-    AstInfo, ColumnDef, Connector, DataType, Envelope, Expr, Format, Ident, MultiConnector, Query,
-    TableConstraint, UnresolvedObjectName, Value,
+    AstInfo, ColumnDef, Connector, CreateSourceFormat, DataType, Envelope, Expr, Format, Ident,
+    Query, TableConstraint, UnresolvedObjectName, Value,
 };
 
 /// A top-level statement (SELECT, INSERT, CREATE, etc.)
@@ -36,7 +38,6 @@ pub enum Statement<T: AstInfo> {
     CreateDatabase(CreateDatabaseStatement),
     CreateSchema(CreateSchemaStatement),
     CreateSource(CreateSourceStatement<T>),
-    CreateSources(CreateSourcesStatement<T>),
     CreateSink(CreateSinkStatement<T>),
     CreateView(CreateViewStatement<T>),
     CreateTable(CreateTableStatement<T>),
@@ -81,7 +82,7 @@ impl<T: AstInfo> Statement<T> {
 }
 
 impl<T: AstInfo> AstDisplay for Statement<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             Statement::Select(stmt) => f.write_node(stmt),
             Statement::Insert(stmt) => f.write_node(stmt),
@@ -91,7 +92,6 @@ impl<T: AstInfo> AstDisplay for Statement<T> {
             Statement::CreateDatabase(stmt) => f.write_node(stmt),
             Statement::CreateSchema(stmt) => f.write_node(stmt),
             Statement::CreateSource(stmt) => f.write_node(stmt),
-            Statement::CreateSources(stmt) => f.write_node(stmt),
             Statement::CreateSink(stmt) => f.write_node(stmt),
             Statement::CreateView(stmt) => f.write_node(stmt),
             Statement::CreateTable(stmt) => f.write_node(stmt),
@@ -136,7 +136,7 @@ pub struct SelectStatement<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for SelectStatement<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_node(&self.query);
         if let Some(as_of) = &self.as_of {
             f.write_str(" AS OF ");
@@ -158,7 +158,7 @@ pub struct InsertStatement<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for InsertStatement<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("INSERT INTO ");
         f.write_node(&self.table_name);
         if !self.columns.is_empty() {
@@ -189,7 +189,7 @@ pub enum CopyDirection {
 }
 
 impl AstDisplay for CopyDirection {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str(match self {
             CopyDirection::To => "TO",
             CopyDirection::From => "FROM",
@@ -205,7 +205,7 @@ pub enum CopyTarget {
 }
 
 impl AstDisplay for CopyTarget {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str(match self {
             CopyTarget::Stdin => "STDIN",
             CopyTarget::Stdout => "STDOUT",
@@ -228,7 +228,7 @@ pub struct CopyStatement<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for CopyStatement<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("COPY ");
         match &self.relation {
             CopyRelation::Table { name, columns } => {
@@ -275,7 +275,7 @@ pub struct UpdateStatement<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for UpdateStatement<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("UPDATE ");
         f.write_node(&self.table_name);
         if !self.assignments.is_empty() {
@@ -300,7 +300,7 @@ pub struct DeleteStatement<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for DeleteStatement<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("DELETE FROM ");
         f.write_node(&self.table_name);
         if let Some(selection) = &self.selection {
@@ -319,7 +319,7 @@ pub struct CreateDatabaseStatement {
 }
 
 impl AstDisplay for CreateDatabaseStatement {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("CREATE DATABASE ");
         if self.if_not_exists {
             f.write_str("IF NOT EXISTS ");
@@ -337,7 +337,7 @@ pub struct CreateSchemaStatement {
 }
 
 impl AstDisplay for CreateSchemaStatement {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("CREATE SCHEMA ");
         if self.if_not_exists {
             f.write_str("IF NOT EXISTS ");
@@ -354,14 +354,14 @@ pub struct CreateSourceStatement<T: AstInfo> {
     pub col_names: Vec<Ident>,
     pub connector: Connector<T>,
     pub with_options: Vec<SqlOption<T>>,
-    pub format: Option<Format<T>>,
-    pub envelope: Envelope<T>,
+    pub format: CreateSourceFormat<T>,
+    pub envelope: Envelope,
     pub if_not_exists: bool,
     pub materialized: bool,
 }
 
 impl<T: AstInfo> AstDisplay for CreateSourceStatement<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("CREATE ");
         if self.materialized {
             f.write_str("MATERIALIZED ");
@@ -384,10 +384,7 @@ impl<T: AstInfo> AstDisplay for CreateSourceStatement<T> {
             f.write_node(&display::comma_separated(&self.with_options));
             f.write_str(")");
         }
-        if let Some(format) = &self.format {
-            f.write_str(" FORMAT ");
-            f.write_node(format);
-        }
+        f.write_node(&self.format);
         match self.envelope {
             Envelope::None => (),
             _ => {
@@ -399,21 +396,6 @@ impl<T: AstInfo> AstDisplay for CreateSourceStatement<T> {
 }
 impl_display_t!(CreateSourceStatement);
 
-/// `CREATE SOURCES`
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CreateSourcesStatement<T: AstInfo> {
-    pub connector: MultiConnector<T>,
-    pub stmts: Vec<CreateSourceStatement<T>>,
-}
-
-impl<T: AstInfo> AstDisplay for CreateSourcesStatement<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
-        f.write_str("CREATE SOURCES FROM ");
-        f.write_node(&self.connector);
-    }
-}
-impl_display_t!(CreateSourcesStatement);
-
 /// `CREATE SINK`
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CreateSinkStatement<T: AstInfo> {
@@ -422,14 +404,14 @@ pub struct CreateSinkStatement<T: AstInfo> {
     pub connector: Connector<T>,
     pub with_options: Vec<SqlOption<T>>,
     pub format: Option<Format<T>>,
-    pub envelope: Option<Envelope<T>>,
+    pub envelope: Option<Envelope>,
     pub with_snapshot: bool,
     pub as_of: Option<Expr<T>>,
     pub if_not_exists: bool,
 }
 
 impl<T: AstInfo> AstDisplay for CreateSinkStatement<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("CREATE SINK ");
         if self.if_not_exists {
             f.write_str("IF NOT EXISTS ");
@@ -480,7 +462,7 @@ pub struct CreateViewStatement<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for CreateViewStatement<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("CREATE");
         if self.if_exists == IfExistsBehavior::Replace {
             f.write_str(" OR REPLACE");
@@ -533,7 +515,7 @@ pub struct CreateTableStatement<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for CreateTableStatement<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("CREATE ");
         if self.temporary {
             f.write_str("TEMPORARY ");
@@ -575,7 +557,7 @@ pub struct CreateIndexStatement<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for CreateIndexStatement<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("CREATE ");
         if self.key_parts.is_none() {
             f.write_str("DEFAULT ");
@@ -616,7 +598,7 @@ pub struct CreateRoleStatement {
 }
 
 impl AstDisplay for CreateRoleStatement {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("CREATE ");
         if self.is_user {
             f.write_str("USER ");
@@ -646,7 +628,7 @@ pub enum CreateRoleOption {
 }
 
 impl AstDisplay for CreateRoleOption {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             CreateRoleOption::SuperUser => f.write_str("SUPERUSER"),
             CreateRoleOption::NoSuperUser => f.write_str("NOSUPERUSER"),
@@ -670,7 +652,7 @@ pub struct CreateTypeStatement<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for CreateTypeStatement<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("CREATE TYPE ");
         f.write_node(&self.name);
         f.write_str(" AS ");
@@ -692,7 +674,7 @@ pub enum CreateTypeAs {
 }
 
 impl AstDisplay for CreateTypeAs {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             CreateTypeAs::List => f.write_str("LIST "),
             CreateTypeAs::Map => f.write_str("MAP "),
@@ -711,7 +693,7 @@ pub struct AlterObjectRenameStatement {
 }
 
 impl AstDisplay for AlterObjectRenameStatement {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("ALTER ");
         f.write_node(&self.object_type);
         f.write_str(" ");
@@ -740,7 +722,7 @@ pub struct AlterIndexOptionsStatement {
 }
 
 impl AstDisplay for AlterIndexOptionsStatement {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("ALTER INDEX ");
         if self.if_exists {
             f.write_str("IF EXISTS ");
@@ -771,7 +753,7 @@ pub struct DiscardStatement {
 }
 
 impl AstDisplay for DiscardStatement {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("DISCARD ");
         f.write_node(&self.target);
     }
@@ -787,7 +769,7 @@ pub enum DiscardTarget {
 }
 
 impl AstDisplay for DiscardTarget {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             DiscardTarget::Plans => f.write_str("PLANS"),
             DiscardTarget::Sequences => f.write_str("SEQUENCES"),
@@ -805,7 +787,7 @@ pub struct DropDatabaseStatement {
 }
 
 impl AstDisplay for DropDatabaseStatement {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("DROP DATABASE ");
         if self.if_exists {
             f.write_str("IF EXISTS ");
@@ -830,7 +812,7 @@ pub struct DropObjectsStatement {
 }
 
 impl AstDisplay for DropObjectsStatement {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("DROP ");
         f.write_node(&self.object_type);
         f.write_str(" ");
@@ -858,7 +840,7 @@ pub struct SetVariableStatement {
 }
 
 impl AstDisplay for SetVariableStatement {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("SET ");
         if self.local {
             f.write_str("LOCAL ");
@@ -877,7 +859,7 @@ pub struct ShowVariableStatement {
 }
 
 impl AstDisplay for ShowVariableStatement {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("SHOW ");
         f.write_node(&self.variable);
     }
@@ -891,7 +873,7 @@ pub struct ShowDatabasesStatement<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for ShowDatabasesStatement<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("SHOW DATABASES");
         if let Some(filter) = &self.filter {
             f.write_str(" ");
@@ -920,7 +902,7 @@ pub struct ShowObjectsStatement<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for ShowObjectsStatement<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("SHOW");
         if self.extended {
             f.write_str(" EXTENDED");
@@ -964,7 +946,7 @@ pub struct ShowIndexesStatement<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for ShowIndexesStatement<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("SHOW ");
         if self.extended {
             f.write_str("EXTENDED ");
@@ -991,7 +973,7 @@ pub struct ShowColumnsStatement<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for ShowColumnsStatement<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("SHOW ");
         if self.extended {
             f.write_str("EXTENDED ");
@@ -1016,7 +998,7 @@ pub struct ShowCreateViewStatement {
 }
 
 impl AstDisplay for ShowCreateViewStatement {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("SHOW CREATE VIEW ");
         f.write_node(&self.view_name);
     }
@@ -1030,7 +1012,7 @@ pub struct ShowCreateSourceStatement {
 }
 
 impl AstDisplay for ShowCreateSourceStatement {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("SHOW CREATE SOURCE ");
         f.write_node(&self.source_name);
     }
@@ -1044,7 +1026,7 @@ pub struct ShowCreateTableStatement {
 }
 
 impl AstDisplay for ShowCreateTableStatement {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("SHOW CREATE TABLE ");
         f.write_node(&self.table_name);
     }
@@ -1058,7 +1040,7 @@ pub struct ShowCreateSinkStatement {
 }
 
 impl AstDisplay for ShowCreateSinkStatement {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("SHOW CREATE SINK ");
         f.write_node(&self.sink_name);
     }
@@ -1072,7 +1054,7 @@ pub struct ShowCreateIndexStatement {
 }
 
 impl AstDisplay for ShowCreateIndexStatement {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("SHOW CREATE INDEX ");
         f.write_node(&self.index_name);
     }
@@ -1086,7 +1068,7 @@ pub struct StartTransactionStatement {
 }
 
 impl AstDisplay for StartTransactionStatement {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("START TRANSACTION");
         if !self.modes.is_empty() {
             f.write_str(" ");
@@ -1103,7 +1085,7 @@ pub struct SetTransactionStatement {
 }
 
 impl AstDisplay for SetTransactionStatement {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("SET TRANSACTION");
         if !self.modes.is_empty() {
             f.write_str(" ");
@@ -1120,7 +1102,7 @@ pub struct CommitStatement {
 }
 
 impl AstDisplay for CommitStatement {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("COMMIT");
         if self.chain {
             f.write_str(" AND CHAIN");
@@ -1136,7 +1118,7 @@ pub struct RollbackStatement {
 }
 
 impl AstDisplay for RollbackStatement {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("ROLLBACK");
         if self.chain {
             f.write_str(" AND CHAIN");
@@ -1154,7 +1136,7 @@ pub struct TailStatement<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for TailStatement<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("TAIL ");
         f.write_node(&self.name);
         if !self.options.is_empty() {
@@ -1179,7 +1161,7 @@ pub struct ExplainStatement<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for ExplainStatement<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("EXPLAIN ");
         if self.options.typed {
             f.write_str("TYPED ");
@@ -1198,7 +1180,7 @@ pub enum InsertSource<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for InsertSource<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             InsertSource::Query(query) => f.write_node(query),
             InsertSource::DefaultValues => f.write_str("DEFAULT VALUES"),
@@ -1221,7 +1203,7 @@ pub enum ObjectType {
 }
 
 impl AstDisplay for ObjectType {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str(match self {
             ObjectType::Schema => "SCHEMA",
             ObjectType::Table => "TABLE",
@@ -1244,7 +1226,7 @@ pub enum ShowStatementFilter<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for ShowStatementFilter<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         use ShowStatementFilter::*;
         match self {
             Like(pattern) => {
@@ -1288,7 +1270,7 @@ impl<T: AstInfo> SqlOption<T> {
 }
 
 impl<T: AstInfo> AstDisplay for SqlOption<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             SqlOption::Value { name, value } => {
                 f.write_node(name);
@@ -1317,7 +1299,7 @@ pub struct WithOption {
 }
 
 impl AstDisplay for WithOption {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_node(&self.key);
         if let Some(opt) = &self.value {
             f.write_str(" = ");
@@ -1334,7 +1316,7 @@ pub enum WithOptionValue {
 }
 
 impl AstDisplay for WithOptionValue {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             WithOptionValue::Value(value) => f.write_node(value),
             WithOptionValue::ObjectName(name) => f.write_node(name),
@@ -1350,7 +1332,7 @@ pub enum TransactionMode {
 }
 
 impl AstDisplay for TransactionMode {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         use TransactionMode::*;
         match self {
             AccessMode(access_mode) => f.write_node(access_mode),
@@ -1370,7 +1352,7 @@ pub enum TransactionAccessMode {
 }
 
 impl AstDisplay for TransactionAccessMode {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         use TransactionAccessMode::*;
         f.write_str(match self {
             ReadOnly => "READ ONLY",
@@ -1389,7 +1371,7 @@ pub enum TransactionIsolationLevel {
 }
 
 impl AstDisplay for TransactionIsolationLevel {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         use TransactionIsolationLevel::*;
         f.write_str(match self {
             ReadUncommitted => "READ UNCOMMITTED",
@@ -1408,7 +1390,7 @@ pub enum SetVariableValue {
 }
 
 impl AstDisplay for SetVariableValue {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         use SetVariableValue::*;
         match self {
             Ident(ident) => f.write_node(ident),
@@ -1426,7 +1408,7 @@ pub struct Assignment<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for Assignment<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_node(&self.id);
         f.write_str(" = ");
         f.write_node(&self.value);
@@ -1446,7 +1428,7 @@ pub enum ExplainStage {
 }
 
 impl AstDisplay for ExplainStage {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             ExplainStage::RawPlan => f.write_str("RAW PLAN"),
             ExplainStage::DecorrelatedPlan => f.write_str("DECORRELATED PLAN"),
@@ -1468,7 +1450,7 @@ pub struct ExplainOptions {
 }
 
 impl<T: AstInfo> AstDisplay for Explainee<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             Explainee::View(name) => {
                 f.write_str("VIEW ");
@@ -1495,7 +1477,7 @@ pub struct DeclareStatement<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for DeclareStatement<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("DECLARE ");
         f.write_node(&self.name);
         f.write_str(" CURSOR FOR ");
@@ -1511,7 +1493,7 @@ pub struct CloseStatement {
 }
 
 impl AstDisplay for CloseStatement {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("CLOSE ");
         f.write_node(&self.name);
     }
@@ -1527,7 +1509,7 @@ pub struct FetchStatement {
 }
 
 impl AstDisplay for FetchStatement {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("FETCH ");
         if let Some(ref count) = self.count {
             f.write_str(format!("{} ", count));
@@ -1549,7 +1531,7 @@ pub enum FetchDirection {
 }
 
 impl AstDisplay for FetchDirection {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             FetchDirection::ForwardAll => f.write_str("ALL"),
             FetchDirection::ForwardCount(count) => f.write_str(format!("{}", count)),

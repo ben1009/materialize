@@ -302,6 +302,7 @@ fn main() {
 fn run(args: Args) -> Result<(), anyhow::Error> {
     panic::set_hook(Box::new(handle_panic));
     sys::enable_sigbus_sigsegv_backtraces()?;
+    sys::enable_termination_signal_cleanup()?;
 
     if args.version > 0 {
         println!("materialized {}", materialized::BUILD_INFO.human_version());
@@ -605,6 +606,9 @@ swap: {swap_total}KB total, {swap_used}KB used",
             experimental_mode: args.experimental,
             safe_mode: args.safe,
             telemetry_url,
+            introspection_frequency: args
+                .introspection_frequency
+                .unwrap_or_else(|| Duration::from_secs(1)),
         },
         runtime.clone(),
     ))?;
@@ -626,9 +630,9 @@ to improve both our software and your queries! Please reach out at:
 
     if args.experimental {
         eprintln!(
-            "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
                                 WARNING!
-!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 Starting Materialize in experimental mode means:
 
 - This node's catalog of views and sources are unstable.
@@ -642,7 +646,7 @@ the node anew.
 longer be started in non-experimental/regular mode.
 
 For more details, see https://materialize.com/docs/cli#experimental-mode
-!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 "
         );
     }

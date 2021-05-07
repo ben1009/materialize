@@ -154,7 +154,6 @@ Minute
 Minutes
 Month
 Months
-Namespace
 Natural
 Next
 No
@@ -222,6 +221,7 @@ Set
 Show
 Sink
 Sinks
+Slot
 Smallint
 Snapshot
 Some

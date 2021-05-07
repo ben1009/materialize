@@ -21,6 +21,7 @@
 //! AST types specific to CREATE/ALTER variants of [crate::ast::Statement]
 //! (commonly referred to as Data Definition Language, or DDL)
 
+use std::fmt;
 use std::path::PathBuf;
 
 use crate::ast::display::{self, AstDisplay, AstFormatter};
@@ -33,7 +34,7 @@ pub enum Schema {
 }
 
 impl AstDisplay for Schema {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             Self::File(path) => {
                 f.write_str("SCHEMA FILE '");
@@ -66,7 +67,7 @@ pub enum AvroSchema<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for AvroSchema<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             Self::CsrUrl {
                 url,
@@ -109,7 +110,7 @@ pub struct CsrSeed {
 }
 
 impl AstDisplay for CsrSeed {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("SEED");
         if let Some(key_schema) = &self.key_schema {
             f.write_str(" KEY SCHEMA '");
@@ -122,6 +123,59 @@ impl AstDisplay for CsrSeed {
     }
 }
 impl_display!(CsrSeed);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CreateSourceFormat<T: AstInfo> {
+    None,
+    /// `CREATE SOURCE .. FORMAT`
+    Bare(Format<T>),
+    /// `CREATE SOURCE .. KEY FORMAT .. VALUE FORMAT`
+    ///
+    /// Also the destination for the legacy `ENVELOPE UPSERT FORMAT ...`
+    KeyValue {
+        key: Format<T>,
+        value: Format<T>,
+    },
+}
+
+impl<T: AstInfo + PartialEq> CreateSourceFormat<T> {
+    /// True if this is a Bare format that can contain no configuration
+    pub fn is_simple(&self) -> bool {
+        match self {
+            CreateSourceFormat::Bare(f) => f.is_simple(),
+            CreateSourceFormat::KeyValue { .. } => false,
+            CreateSourceFormat::None => false,
+        }
+    }
+
+    /// The value portion of a `KeyValue` format, or the only format in `Bare`
+    pub fn value(&self) -> Option<&Format<T>> {
+        match self {
+            CreateSourceFormat::None => None,
+            CreateSourceFormat::Bare(f) => Some(f),
+            CreateSourceFormat::KeyValue { value, .. } => Some(value),
+        }
+    }
+}
+
+impl<T: AstInfo> AstDisplay for CreateSourceFormat<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        match self {
+            CreateSourceFormat::None => {}
+            CreateSourceFormat::Bare(format) => {
+                f.write_str(" FORMAT ");
+                f.write_node(format)
+            }
+            CreateSourceFormat::KeyValue { key, value } => {
+                f.write_str(" KEY FORMAT ");
+                f.write_node(key);
+                f.write_str(" VALUE FORMAT ");
+                f.write_node(value);
+            }
+        }
+    }
+}
+impl_display_t!(CreateSourceFormat);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Format<T: AstInfo> {
@@ -141,22 +195,29 @@ pub enum Format<T: AstInfo> {
     Text,
 }
 
+impl<T: AstInfo> Format<T> {
+    /// True if the format cannot carry any configuration
+    pub fn is_simple(&self) -> bool {
+        matches!(self, Format::Bytes | Format::Text)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Envelope<T: AstInfo> {
+pub enum Envelope {
     None,
     Debezium(DbzMode),
-    Upsert(Option<Format<T>>),
+    Upsert,
     CdcV2,
 }
 
-impl<T: AstInfo> Default for Envelope<T> {
+impl Default for Envelope {
     fn default() -> Self {
         Self::None
     }
 }
 
-impl<T: AstInfo> AstDisplay for Envelope<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+impl AstDisplay for Envelope {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             Self::None => {
                 // this is unreachable as long as the default is None, but include it in case we ever change that
@@ -166,12 +227,8 @@ impl<T: AstInfo> AstDisplay for Envelope<T> {
                 f.write_str("DEBEZIUM");
                 f.write_node(mode);
             }
-            Self::Upsert(format) => {
+            Self::Upsert => {
                 f.write_str("UPSERT");
-                if let Some(format) = format {
-                    f.write_str(" FORMAT ");
-                    f.write_node(format);
-                }
             }
             Self::CdcV2 => {
                 f.write_str("MATERIALIZE");
@@ -179,10 +236,10 @@ impl<T: AstInfo> AstDisplay for Envelope<T> {
         }
     }
 }
-impl_display_t!(Envelope);
+impl_display!(Envelope);
 
 impl<T: AstInfo> AstDisplay for Format<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             Self::Bytes => f.write_str("BYTES"),
             Self::Avro(inner) => {
@@ -241,7 +298,7 @@ impl Default for Compression {
 }
 
 impl AstDisplay for Compression {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             Self::Gzip => f.write_str("GZIP"),
             Self::None => f.write_str("NONE"),
@@ -265,7 +322,7 @@ impl Default for DbzMode {
 }
 
 impl AstDisplay for DbzMode {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             Self::Plain => f.write_str(""),
             Self::Upsert => f.write_str(" UPSERT"),
@@ -304,10 +361,10 @@ pub enum Connector<T: AstInfo> {
         conn: String,
         /// The name of the publication to sync
         publication: String,
-        /// The namespace the synced table belongs to
-        namespace: String,
+        /// The replication slot name that will be created upstream
+        slot: Option<String>,
         /// The name of the table to sync
-        table: String,
+        table: UnresolvedObjectName,
         /// The expected column schema of the synced table
         columns: Vec<ColumnDef<T>>,
     },
@@ -320,7 +377,7 @@ pub enum Connector<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for Connector<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             Connector::File { path, compression } => {
                 f.write_str("FILE '");
@@ -375,19 +432,21 @@ impl<T: AstInfo> AstDisplay for Connector<T> {
             Connector::Postgres {
                 conn,
                 publication,
-                namespace,
                 table,
                 columns,
+                slot,
             } => {
                 f.write_str("POSTGRES HOST '");
                 f.write_str(&display::escape_single_quote_string(conn));
                 f.write_str("' PUBLICATION '");
                 f.write_str(&display::escape_single_quote_string(publication));
-                f.write_str("' NAMESPACE '");
-                f.write_str(&display::escape_single_quote_string(namespace));
-                f.write_str("' TABLE '");
-                f.write_str(&display::escape_single_quote_string(table));
-                f.write_str("' (");
+                if let Some(slot) = slot {
+                    f.write_str("' SLOT '");
+                    f.write_str(&display::escape_single_quote_string(slot));
+                }
+                f.write_str("' TABLE ");
+                f.write_node(table);
+                f.write_str(" (");
                 f.write_node(&display::comma_separated(columns));
                 f.write_str(")");
             }
@@ -406,49 +465,11 @@ impl<T: AstInfo> AstDisplay for Connector<T> {
 }
 impl_display_t!(Connector);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum MultiConnector<T: AstInfo> {
-    Postgres {
-        /// The postgres connection string
-        conn: String,
-        /// The name of the publication to sync
-        publication: String,
-        /// The namespace the synced table belongs to
-        namespace: String,
-        /// The tables to sync
-        tables: Vec<PgTable<T>>,
-    },
-}
-
-impl<T: AstInfo> AstDisplay for MultiConnector<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
-        match self {
-            MultiConnector::Postgres {
-                conn,
-                publication,
-                namespace,
-                tables,
-            } => {
-                f.write_str("POSTGRES HOST '");
-                f.write_str(&display::escape_single_quote_string(conn));
-                f.write_str("' PUBLICATION '");
-                f.write_str(&display::escape_single_quote_string(publication));
-                f.write_str("' NAMESPACE '");
-                f.write_str(&display::escape_single_quote_string(namespace));
-                f.write_str("' TABLES (");
-                f.write_node(&display::comma_separated(tables));
-                f.write_str(")");
-            }
-        }
-    }
-}
-impl_display_t!(MultiConnector);
-
 /// Information about upstream Postgres tables used for replication sources
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PgTable<T: AstInfo> {
     /// The name of the table to sync
-    pub name: String,
+    pub name: UnresolvedObjectName,
     /// The name for the table in Materialize
     pub alias: T::ObjectName,
     /// The expected column schema of the synced table
@@ -456,10 +477,8 @@ pub struct PgTable<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for PgTable<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
-        f.write_str("'");
-        f.write_str(&display::escape_single_quote_string(&self.name));
-        f.write_str("'");
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_node(&self.name);
         f.write_str(" AS ");
         f.write_str(self.alias.to_ast_string());
         if !self.columns.is_empty() {
@@ -481,7 +500,7 @@ pub enum S3KeySource {
 }
 
 impl AstDisplay for S3KeySource {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             S3KeySource::Scan { bucket } => {
                 f.write_str(" BUCKET SCAN '");
@@ -525,7 +544,7 @@ pub enum TableConstraint<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for TableConstraint<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             TableConstraint::Unique {
                 name,
@@ -578,7 +597,7 @@ pub struct ColumnDef<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for ColumnDef<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_node(&self.name);
         f.write_str(" ");
         f.write_node(&self.data_type);
@@ -613,7 +632,7 @@ pub struct ColumnOptionDef<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for ColumnOptionDef<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_node(&display_constraint_name(&self.name));
         f.write_node(&self.option);
     }
@@ -645,7 +664,7 @@ pub enum ColumnOption<T: AstInfo> {
 }
 
 impl<T: AstInfo> AstDisplay for ColumnOption<T> {
-    fn fmt(&self, f: &mut AstFormatter) {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         use ColumnOption::*;
         match self {
             Null => f.write_str("NULL"),
@@ -684,7 +703,10 @@ impl_display_t!(ColumnOption);
 fn display_constraint_name<'a>(name: &'a Option<Ident>) -> impl AstDisplay + 'a {
     struct ConstraintName<'a>(&'a Option<Ident>);
     impl<'a> AstDisplay for ConstraintName<'a> {
-        fn fmt(&self, f: &mut AstFormatter) {
+        fn fmt<W>(&self, f: &mut AstFormatter<W>)
+        where
+            W: fmt::Write,
+        {
             if let Some(name) = self.0 {
                 f.write_str("CONSTRAINT ");
                 f.write_node(name);

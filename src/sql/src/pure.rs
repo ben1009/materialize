@@ -11,21 +11,21 @@
 //!
 //! See the [crate-level documentation](crate) for details.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
-use anyhow::{anyhow, bail, Context};
+use anyhow::{anyhow, bail, ensure, Context};
 use aws_arn::ARN;
 use tokio::fs::File;
 use tokio::io::AsyncBufReadExt;
 use tokio::task;
 use tokio::time::Duration;
+use uuid::Uuid;
 
 use repr::strconv;
-use sql_parser::ast::{display::AstDisplay, UnresolvedObjectName};
+use sql_parser::ast::display::AstDisplay;
 use sql_parser::ast::{
-    AvroSchema, ColumnDef, ColumnOption, ColumnOptionDef, Connector, CreateSourceStatement,
-    CreateSourcesStatement, CsrSeed, DbzMode, Envelope, Format, Ident, MultiConnector, Raw,
-    Statement,
+    AvroSchema, ColumnDef, ColumnOption, Connector, CreateSourceFormat, CreateSourceStatement,
+    CsrSeed, DbzMode, Envelope, Format, Ident, Raw, Statement, UnresolvedObjectName,
 };
 use sql_parser::parser::parse_columns;
 
@@ -56,14 +56,14 @@ pub async fn purify(mut stmt: Statement<Raw>) -> Result<Statement<Raw>, anyhow::
 
         let mut file = None;
         match connector {
-            Connector::Kafka { broker, .. } => {
+            Connector::Kafka { broker, topic, .. } => {
                 if !broker.contains(':') {
                     *broker += ":9092";
                 }
 
                 // Verify that the provided security options are valid and then test them.
                 config_options = kafka_util::extract_config(&mut with_options_map)?;
-                kafka_util::test_config(&broker, &config_options).await?;
+                kafka_util::test_config(&broker, &topic, &config_options).await?;
             }
             Connector::AvroOcf { path, .. } => {
                 let path = path.clone();
@@ -108,11 +108,19 @@ pub async fn purify(mut stmt: Statement<Raw>) -> Result<Statement<Raw>, anyhow::
             }
             Connector::Postgres {
                 conn,
-                namespace,
                 table,
                 columns,
+                slot,
                 ..
-            } => purify_postgres_table(conn, namespace, table, columns).await?,
+            } => {
+                slot.get_or_insert_with(|| {
+                    format!(
+                        "materialize_{}",
+                        Uuid::new_v4().to_string().replace('-', "")
+                    )
+                });
+                purify_postgres_table(conn, table, columns).await?;
+            }
             Connector::PubNub { .. } => (),
         }
 
@@ -125,69 +133,16 @@ pub async fn purify(mut stmt: Statement<Raw>) -> Result<Statement<Raw>, anyhow::
             &config_options,
         )
         .await?;
-        if let sql_parser::ast::Envelope::Upsert(_) = envelope {
-            // TODO(bwm): this will be removed with the upcoming upsert rationalization
-            //
-            // The `format` argument is mutated in the call to purify_format, so it must be the
-            // original format from the outer envelope. The envelope is just matched against, and
-            // can be cloned safely.
-            let envelope_dupe = envelope.clone();
-            if let sql_parser::ast::Envelope::Upsert(format) = envelope {
-                purify_format(
-                    format,
-                    connector,
-                    &envelope_dupe,
-                    col_names,
-                    None,
-                    &config_options,
-                )
-                .await?;
-            }
-        }
-    }
-    if let Statement::CreateSources(CreateSourcesStatement { connector, stmts }) = &mut stmt {
-        match connector {
-            MultiConnector::Postgres {
-                conn,
-                publication,
-                namespace,
-                tables,
-            } => {
-                let mut create_stmts = Vec::with_capacity(tables.len());
-                for table in tables.into_iter() {
-                    purify_postgres_table(&conn, &namespace, &table.name, &mut table.columns)
-                        .await?;
-                    create_stmts.push(CreateSourceStatement {
-                        name: UnresolvedObjectName(vec![Ident::from(table.name.as_str())]),
-                        col_names: table.columns.iter().map(|c| c.name.clone()).collect(),
-                        connector: Connector::Postgres {
-                            conn: conn.to_owned(),
-                            publication: publication.to_owned(),
-                            namespace: namespace.to_owned(),
-                            table: table.name.to_owned(),
-                            columns: table.columns.clone(),
-                        },
-                        format: None,
-                        with_options: vec![],
-                        envelope: Envelope::None,
-                        if_not_exists: false,
-                        materialized: false,
-                    });
-                }
-                *stmts = create_stmts;
-            }
-        }
     }
     Ok(stmt)
 }
 
 async fn purify_postgres_table(
     conn: &str,
-    namespace: &str,
-    table: &str,
+    table: &UnresolvedObjectName,
     columns: &mut Vec<ColumnDef<Raw>>,
 ) -> Result<(), anyhow::Error> {
-    let fetched_columns = postgres_util::table_info(conn, namespace, table)
+    let fetched_columns = postgres_util::table_info(conn, &table.to_ast_string())
         .await?
         .schema
         .iter()
@@ -211,29 +166,32 @@ async fn purify_postgres_table(
                         .join(", ")
                 )
             }
-            for (c, u) in columns.into_iter().zip(upstream_columns) {
-                // By default, Postgres columns are nullable. This means that both
-                // of the following column definitions are nullable:
-                //     example_col bool
-                //     example_col bool NULL
-                // Fetched upstream column information, on the other hand, will always
-                // include NULL if a column is nullable. In order to compare the user-provided
-                // columns with the fetched columns, we need to append a NULL constraint
-                // to any user-provided columns that are implicitly NULL.
-                if !c.options.contains(&ColumnOptionDef {
-                    name: None,
-                    option: ColumnOption::NotNull,
-                }) && !c.options.contains(&ColumnOptionDef {
-                    name: None,
-                    option: ColumnOption::Null,
-                }) {
-                    c.options.push(ColumnOptionDef {
-                        name: None,
-                        option: ColumnOption::Null,
-                    });
-                }
-                if c != &u {
-                    bail!("incorrect column specification: specified column does not match upstream source, specified: {}, upstream: {}", c, u);
+            for (column, upstream_column) in columns.into_iter().zip(upstream_columns) {
+                if column != &upstream_column {
+                    if column.name != upstream_column.name
+                        || column.data_type != upstream_column.data_type
+                        || column.collation != upstream_column.collation
+                    {
+                        bail!("incorrect column specification: specified column does not match upstream source, specified: {}, upstream: {}", column, upstream_column);
+                    }
+
+                    // Some column modifiers can be omitted by the user. Add any potentially omitted column
+                    // options, and compare again.
+                    let mut cols: HashSet<&ColumnOption<Raw>> =
+                        column.options.iter().map(|o| &o.option).collect();
+                    let has_null = cols.contains(&ColumnOption::Null);
+                    let has_not_null = cols.contains(&ColumnOption::NotNull);
+                    let has_primary_key = cols.contains(&ColumnOption::Unique { is_primary: true });
+
+                    if !has_null && !has_not_null && !has_primary_key {
+                        cols.insert(&ColumnOption::Null);
+                    } else if has_primary_key && !has_not_null {
+                        cols.insert(&ColumnOption::NotNull);
+                    }
+                    let upstream_cols = upstream_column.options.iter().map(|o| &o.option).collect();
+                    if cols != upstream_cols {
+                        bail!("incorrect column specification: specified column modifiers do not match upstream source, specified: {}, upstream: {}", column, upstream_column);
+                    }
                 }
             }
         }
@@ -244,15 +202,78 @@ async fn purify_postgres_table(
 }
 
 async fn purify_format(
-    format: &mut Option<Format<Raw>>,
+    format: &mut CreateSourceFormat<Raw>,
     connector: &mut Connector<Raw>,
-    envelope: &Envelope<Raw>,
+    envelope: &Envelope,
+    col_names: &mut Vec<Ident>,
+    file: Option<File>,
+    connector_options: &BTreeMap<String, String>,
+) -> Result<(), anyhow::Error> {
+    if matches!(format, CreateSourceFormat::KeyValue { .. })
+        && !matches!(connector, Connector::Kafka { .. })
+    {
+        bail!("Kafka sources are the only source type that can provide KEY/VALUE formats")
+    }
+
+    // the existing semantics of Upsert is that specifying a simple bare format
+    // duplicates the format into the key.
+    //
+    // TODO(bwm): We should either make this the semantics everywhere, or deprecate
+    // this.
+    if matches!(connector, Connector::Kafka { .. })
+        && matches!(envelope, Envelope::Upsert)
+        && format.is_simple()
+    {
+        let value = format.value().map(|f| f.clone());
+        if let Some(value) = value {
+            *format = CreateSourceFormat::KeyValue {
+                key: value.clone(),
+                value,
+            }
+        } else {
+            bail!("Upsert requires either a VALUE FORMAT or a bare TEXT or BYTES format");
+        };
+    }
+
+    match format {
+        CreateSourceFormat::None => {}
+        CreateSourceFormat::Bare(format) => {
+            purify_format_single(
+                format,
+                connector,
+                envelope,
+                col_names,
+                file,
+                connector_options,
+            )
+            .await?
+        }
+
+        CreateSourceFormat::KeyValue { key, value: val } => {
+            ensure!(
+                file.is_none(),
+                anyhow!("[internal-error] File sources cannot be key-value sources")
+            );
+
+            purify_format_single(key, connector, envelope, col_names, None, connector_options)
+                .await?;
+            purify_format_single(val, connector, envelope, col_names, None, connector_options)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn purify_format_single(
+    format: &mut Format<Raw>,
+    connector: &mut Connector<Raw>,
+    envelope: &Envelope,
     col_names: &mut Vec<Ident>,
     file: Option<File>,
     connector_options: &BTreeMap<String, String>,
 ) -> Result<(), anyhow::Error> {
     match format {
-        Some(Format::Avro(schema)) => match schema {
+        Format::Avro(schema) => match schema {
             AvroSchema::CsrUrl {
                 url,
                 seed,
@@ -294,32 +315,15 @@ async fn purify_format(
                 schema: sql_parser::ast::Schema::File(path),
                 with_options,
             } => {
-                if matches!(envelope, Envelope::Debezium(DbzMode::Upsert)) {
-                    // TODO(bwm): Support key schemas everywhere, something like
-                    // https://github.com/MaterializeInc/materialize/pull/6286
-                    bail!(
-                        "ENVELOPE DEBEZIUM UPSERT can only be used with schemas from \
-                           the confluent schema registry, and requires a key schema"
-                    );
-                }
-                let value_schema = tokio::fs::read_to_string(path).await?;
+                let file_schema = tokio::fs::read_to_string(path).await?;
                 *schema = AvroSchema::Schema {
-                    schema: sql_parser::ast::Schema::Inline(value_schema),
+                    schema: sql_parser::ast::Schema::Inline(file_schema),
                     with_options: with_options.clone(),
                 };
             }
-            _ => {
-                if matches!(envelope, Envelope::Debezium(DbzMode::Upsert)) {
-                    // TODO(bwm): Support key schemas everywhere, something like
-                    // https://github.com/MaterializeInc/materialize/pull/6286
-                    bail!(
-                        "ENVELOPE DEBEZIUM UPSERT can only be used with schemas from \
-                           the confluent schema registry, and requires a key schema"
-                    );
-                }
-            }
+            _ => {}
         },
-        Some(Format::Protobuf { schema, .. }) => {
+        Format::Protobuf { schema, .. } => {
             if let sql_parser::ast::Schema::File(path) = schema {
                 let descriptors = tokio::fs::read(path).await?;
                 let mut buf = String::new();
@@ -327,11 +331,11 @@ async fn purify_format(
                 *schema = sql_parser::ast::Schema::Inline(buf);
             }
         }
-        Some(Format::Csv {
+        Format::Csv {
             header_row,
             delimiter,
             ..
-        }) => {
+        } => {
             if *header_row && col_names.is_empty() {
                 if let Some(file) = file {
                     let file = tokio::io::BufReader::new(file);
@@ -349,7 +353,7 @@ async fn purify_format(
                 }
             }
         }
-        _ => (),
+        Format::Bytes | Format::Regex(_) | Format::Json | Format::Text => (),
     }
     Ok(())
 }

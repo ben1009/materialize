@@ -297,6 +297,19 @@ impl DataflowDesc {
     }
 }
 
+/// A description of how to interpret data from various sources
+///
+/// Almost all sources only present values as part of their records, but Kafka allows a key to be
+/// associated with each record, which has a possibly independent encoding.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum SourceDataEncoding {
+    Single(DataEncoding),
+    KeyValue {
+        key: DataEncoding,
+        value: DataEncoding,
+    },
+}
+
 /// A description of how each row should be decoded, from a string of bytes to a sequence of
 /// Differential updates.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -311,48 +324,92 @@ pub enum DataEncoding {
     Text,
 }
 
+impl SourceDataEncoding {
+    /// Return the encoding if this was a `SourceDataEncoding::Single`, else return an error
+    pub fn single(self) -> Option<DataEncoding> {
+        match self {
+            SourceDataEncoding::Single(encoding) => Some(encoding),
+            SourceDataEncoding::KeyValue { .. } => None,
+        }
+    }
+
+    /// Return either the Single encoding if this was a `SourceDataEncoding::Single`, else return the value encoding
+    pub fn value(self) -> DataEncoding {
+        match self {
+            SourceDataEncoding::Single(encoding) => encoding,
+            SourceDataEncoding::KeyValue { value, .. } => value,
+        }
+    }
+
+    pub fn value_ref(&self) -> &DataEncoding {
+        match self {
+            SourceDataEncoding::Single(encoding) => encoding,
+            SourceDataEncoding::KeyValue { value, .. } => value,
+        }
+    }
+
+    pub fn desc(&self, envelope: &SourceEnvelope) -> Result<RelationDesc, anyhow::Error> {
+        match self {
+            SourceDataEncoding::Single(enc) => enc.desc(envelope, RelationDesc::empty(), None),
+            SourceDataEncoding::KeyValue { key, value } => {
+                // Add columns for the key, if using the upsert envelope.
+                // TODO: this will be removed with upsert value rewriting
+                let desc = if matches!(envelope, SourceEnvelope::Upsert) {
+                    let key_desc = {
+                        let key_desc =
+                            key.desc(&SourceEnvelope::None, RelationDesc::empty(), None)?;
+
+                        // It doesn't make sense for the key to have keys.
+                        assert!(key_desc.typ().keys.is_empty());
+
+                        // Add the key columns as a key.
+                        let key_indices = (0..key_desc.arity()).collect();
+                        let key_desc = key_desc.with_key(key_indices);
+
+                        // Rename key columns to "keyN" if the encoding is not Avro.
+                        match key {
+                            DataEncoding::Avro(_) => key_desc,
+                            _ => {
+                                let names =
+                                    (0..key_desc.arity()).map(|i| Some(format!("key{}", i)));
+                                key_desc.with_names(names)
+                            }
+                        }
+                    };
+                    let key_schema = if let DataEncoding::Avro(AvroEncoding { schema, .. }) = key {
+                        Some(&**schema)
+                    } else {
+                        None
+                    };
+                    value.desc(envelope, key_desc, key_schema)
+                } else {
+                    value.desc(envelope, RelationDesc::empty(), None)
+                };
+                desc
+            }
+        }
+    }
+}
+
 impl DataEncoding {
     /// Computes the [`RelationDesc`] for the relation specified by the this
     /// data encoding and envelope.s
-    pub fn desc(&self, envelope: &SourceEnvelope) -> Result<RelationDesc, anyhow::Error> {
-        // Add columns for the key, if using the upsert envelope.
-        let key_desc = match envelope {
-            SourceEnvelope::Upsert(key_encoding) => {
-                let key_desc = key_encoding.desc(&SourceEnvelope::None)?;
-
-                // It doesn't make sense for the key to have keys.
-                assert!(key_desc.typ().keys.is_empty());
-
-                // Add the key columns as a key.
-                let key = (0..key_desc.arity()).collect();
-                let key_desc = key_desc.with_key(key);
-
-                // Rename key columns to "keyN" if the encoding is not Avro.
-                match key_encoding {
-                    DataEncoding::Avro(_) => key_desc,
-                    _ => {
-                        let names = (0..key_desc.arity()).map(|i| Some(format!("key{}", i)));
-                        key_desc.with_names(names)
-                    }
-                }
-            }
-            _ => RelationDesc::empty(),
-        };
-
+    fn desc(
+        &self,
+        envelope: &SourceEnvelope,
+        key_desc: RelationDesc,
+        key_schema: Option<&str>,
+    ) -> Result<RelationDesc, anyhow::Error> {
         // Add columns for the data, based on the encoding format.
         Ok(match self {
-            DataEncoding::Bytes => key_desc.with_column("data", ScalarType::Bytes.nullable(false)),
+            DataEncoding::Bytes => {
+                key_desc.with_named_column("data", ScalarType::Bytes.nullable(false))
+            }
             DataEncoding::AvroOcf(AvroOcfEncoding { .. })
             | DataEncoding::Avro(AvroEncoding { .. }) => {
-                let (value_schema, key_schema) = match self {
-                    DataEncoding::AvroOcf(AvroOcfEncoding { reader_schema }) => {
-                        (reader_schema, None)
-                    }
-                    DataEncoding::Avro(AvroEncoding {
-                        key_schema,
-                        value_schema,
-                        ..
-                    }) => (value_schema, key_schema.as_ref()),
+                let value_schema = match self {
+                    DataEncoding::AvroOcf(AvroOcfEncoding { reader_schema }) => (reader_schema),
+                    DataEncoding::Avro(AvroEncoding { schema, .. }) => schema,
                     _ => unreachable!(),
                 };
                 let mut columns =
@@ -366,9 +423,9 @@ impl DataEncoding {
                     // the first two columns ("before" and "after"), and uses the information in the other ones itself
                     columns.truncate(2);
                 }
-                let desc = columns
-                    .into_iter()
-                    .fold(key_desc, |desc, (name, ty)| desc.with_column(name, ty));
+                let desc = columns.into_iter().fold(key_desc, |desc, (name, ty)| {
+                    desc.with_named_column(name, ty)
+                });
                 let key_schema_indices = key_schema.as_ref().and_then(|key_schema| {
                     avro::validate_key_schema(key_schema, &desc)
                         .map(Some)
@@ -395,7 +452,7 @@ impl DataEncoding {
                 validate_descriptors(message_name, &d)?
                     .into_iter()
                     .fold(key_desc, |desc, (name, ty)| {
-                        desc.with_column(name.unwrap(), ty)
+                        desc.with_named_column(name.unwrap(), ty)
                     })
             }
             DataEncoding::Regex(RegexEncoding { regex }) => regex
@@ -412,14 +469,19 @@ impl DataEncoding {
                         Some(name) => name.to_owned(),
                     };
                     let ty = ScalarType::String.nullable(true);
-                    desc.with_column(name, ty)
+                    desc.with_named_column(name, ty)
                 }),
             DataEncoding::Csv(CsvEncoding { n_cols, .. }) => {
                 (1..=*n_cols).fold(key_desc, |desc, i| {
-                    desc.with_column(format!("column{}", i), ScalarType::String.nullable(false))
+                    desc.with_named_column(
+                        format!("column{}", i),
+                        ScalarType::String.nullable(false),
+                    )
                 })
             }
-            DataEncoding::Text => key_desc.with_column("text", ScalarType::String.nullable(false)),
+            DataEncoding::Text => {
+                key_desc.with_named_column("text", ScalarType::String.nullable(false))
+            }
             DataEncoding::Postgres(desc) => desc.clone(),
         })
     }
@@ -436,13 +498,16 @@ impl DataEncoding {
             DataEncoding::Postgres(_) => "Postgres",
         }
     }
+
+    pub fn is_avro(&self) -> bool {
+        matches!(self, DataEncoding::Avro(_))
+    }
 }
 
 /// Encoding in Avro format.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AvroEncoding {
-    pub key_schema: Option<String>,
-    pub value_schema: String,
+    pub schema: String,
     pub schema_registry_config: Option<ccsr::ClientConfig>,
     pub confluent_wire_format: bool,
 }
@@ -516,7 +581,7 @@ pub struct SinkAsOf {
 pub enum SourceEnvelope {
     None,
     Debezium(DebeziumDeduplicationStrategy, DebeziumMode),
-    Upsert(DataEncoding),
+    Upsert,
     CdcV2,
 }
 
@@ -525,7 +590,7 @@ impl SourceEnvelope {
         match self {
             SourceEnvelope::None => avro::EnvelopeType::None,
             SourceEnvelope::Debezium { .. } => avro::EnvelopeType::Debezium,
-            SourceEnvelope::Upsert(_) => avro::EnvelopeType::Upsert,
+            SourceEnvelope::Upsert => avro::EnvelopeType::Upsert,
             SourceEnvelope::CdcV2 => avro::EnvelopeType::CdcV2,
         }
     }
@@ -548,7 +613,7 @@ pub enum Compression {
 pub enum SourceConnector {
     External {
         connector: ExternalSourceConnector,
-        encoding: DataEncoding,
+        encoding: SourceDataEncoding,
         envelope: SourceEnvelope,
         consistency: Consistency,
         ts_frequency: Duration,
@@ -635,6 +700,25 @@ impl ExternalSourceConnector {
             ExternalSourceConnector::S3(_) => "s3",
             ExternalSourceConnector::Postgres(_) => "postgres",
             ExternalSourceConnector::PubNub(_) => "pubnub",
+        }
+    }
+
+    /// Optionally returns the name of the upstream resource this source corresponds to.
+    /// (Currently only implemented for Kafka and Kinesis, to match old-style behavior
+    ///  TODO: decide whether we want file paths and other upstream names to show up in metrics too.
+    pub fn upstream_name(&self) -> Option<&str> {
+        match self {
+            ExternalSourceConnector::Kafka(KafkaSourceConnector { topic, .. }) => {
+                Some(topic.as_str())
+            }
+            ExternalSourceConnector::Kinesis(KinesisSourceConnector { stream_name, .. }) => {
+                Some(stream_name.as_str())
+            }
+            ExternalSourceConnector::File(_) => None,
+            ExternalSourceConnector::AvroOcf(_) => None,
+            ExternalSourceConnector::S3(_) => None,
+            ExternalSourceConnector::Postgres(_) => None,
+            ExternalSourceConnector::PubNub(_) => None,
         }
     }
 
@@ -740,9 +824,11 @@ pub struct FileSourceConnector {
 pub struct PostgresSourceConnector {
     pub conn: String,
     pub publication: String,
-    pub namespace: String,
-    pub table: String,
+    // The table's UnresolvedObjectName.to_ast_string(), for use in literal SQL
+    // strings.
+    pub ast_table: String,
     pub cast_exprs: Vec<MirScalarExpr>,
+    pub slot_name: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

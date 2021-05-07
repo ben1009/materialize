@@ -356,10 +356,10 @@ any non-alphanumeric characters.)
 
 ## Development
 
-mzbuild and mzcompose are Python 3 libraries that lives in
-[misc/python/materialize/cli](/misc/python/materialize/cli).
+mzbuild and associated tools are written in Python 3 and live in
+[misc/python/materialize](/misc/python/materialize).
 
-Its only dependency is Python 3.5+, which is easy to find or pre-installed on
+Their only dependency is Python 3.5+, which is easy to find or pre-installed on
 most Linux distributions, and pre-installed on recent versions of macOS, too.
 Python dependencies are automatically installed into a virtualenv by the
 [pyactivate wrapper script](/bin/pyactivate).
@@ -384,9 +384,9 @@ The directory containing a `mzbuild.yml` file is called the "mzbuild context."
 ```yml
 name: materialized
 pre-image:
-  type: cargo-build
-  bin: materialized
-  strip: false
+  - type: cargo-build
+    bin: materialized
+    strip: false
 publish: true
 ```
 
@@ -396,8 +396,9 @@ publish: true
   within the repository. If the image is publishable, it will be published to
   Docker Hub as `materialize/<name>`.
 
-* `pre-image` (map) specifies a plugin to run *before* invoking `docker build`.
-  This is where the magic happens for Rust code.
+* `pre-image` (list of maps) specifies plugins to run *before* invoking `docker
+  build`. The plugins are run in order. This is where the magic happens for
+  Rust code.
 
   At the moment `pre-image` only supports three plugins:
 

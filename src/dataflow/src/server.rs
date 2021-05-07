@@ -35,7 +35,7 @@ use dataflow_types::{
     Consistency, DataflowDesc, DataflowError, ExternalSourceConnector, PeekResponse,
     SourceConnector, TimestampSourceUpdate, Update,
 };
-use expr::{GlobalId, MapFilterProject, PartitionId, RowSetFinishing};
+use expr::{GlobalId, PartitionId, RowSetFinishing};
 use repr::{Diff, Row, RowArena, Timestamp};
 
 use crate::arrangement::manager::{TraceBundle, TraceManager};
@@ -81,7 +81,7 @@ pub enum SequencedCommand {
         /// Actions to apply to the result set before returning them.
         finishing: RowSetFinishing,
         /// Linear operation to apply in-line on each result.
-        map_filter_project: MapFilterProject,
+        map_filter_project: expr::SafeMfpPlan,
     },
     /// Cancel the peek associated with the given `conn_id`.
     CancelPeek {
@@ -404,8 +404,6 @@ where
         while !shutdown {
             // Enable trace compaction.
             self.render_state.traces.maintenance();
-            // Compact timestamp bindings
-            self.compact_timestamp_bindings();
 
             // Ask Timely to execute a unit of work. If Timely decides there's
             // nothing to do, it will park the thread. We rely on another thread
@@ -833,15 +831,6 @@ where
             }
         }
     }
-
-    /// Attempt to compact source timestamp bindings
-    fn compact_timestamp_bindings(&self) {
-        for (_, ts_history) in self.render_state.ts_histories.borrow().iter() {
-            if let TimestampDataUpdate::BringYourOwn(history) = ts_history {
-                history.compact();
-            }
-        }
-    }
 }
 
 pub struct LocalInput {
@@ -866,7 +855,7 @@ struct PendingPeek {
     /// limit.
     finishing: RowSetFinishing,
     /// Linear operators to apply in-line to all results.
-    map_filter_project: MapFilterProject,
+    map_filter_project: expr::SafeMfpPlan,
     /// The data from which the trace derives.
     trace_bundle: TraceBundle,
 }

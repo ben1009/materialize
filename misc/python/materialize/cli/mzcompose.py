@@ -15,6 +15,7 @@ from typing_extensions import NoReturn
 import argparse
 import json
 import os
+import subprocess
 import sys
 import webbrowser
 
@@ -33,7 +34,12 @@ MIN_COMPOSE_VERSION = (1, 24, 0)
 
 def main(argv: List[str]) -> int:
     # Lightly parse the arguments so we know what to do.
-    args, unknown_args = ArgumentParser().parse_known_args(argv)
+    parser = ArgumentParser()
+    args, unknown_args = parser.parse_known_args(argv)
+    if args.help:
+        parser.print_help()
+        return 0
+
     if args.file:
         raise errors.MzConfigurationError("-f/--file option not supported")
     elif args.project_directory:
@@ -137,9 +143,9 @@ def main(argv: List[str]) -> int:
     announce("Delegating to Docker Compose")
     proc = composition.run(
         [
-            *unknown_args,
             *([args.command] if args.command is not None else []),
             *([args.first_command_arg] if args.first_command_arg is not None else []),
+            *unknown_args,
             *args.remainder,
         ],
         check=False,
@@ -222,14 +228,18 @@ def web(composition: mzcompose.Composition, service: Optional[str]) -> int:
 class ArgumentParser(argparse.ArgumentParser):
     def __init__(self) -> None:
         super().__init__(add_help=False)
+        # If you add an option here, add it to the help text in `print_help`.
         self.add_argument("--mz-quiet", action="store_true", default=None)
         self.add_argument("--mz-find")
-        self.add_argument("--mz-build-mode", default="release")
+        self.add_argument(
+            "--mz-build-mode", default="release", choices=["dev", "release"]
+        )
         self.add_argument("-f", "--file")
         self.add_argument("--project-directory")
         self.add_argument("command", nargs="?")
         self.add_argument("first_command_arg", nargs="?")
-        self.add_argument("remainder", nargs=argparse.REMAINDER)
+        self.add_argument("remainder", nargs="*")
+        self.add_argument("--help", action="store_true", default=False)
 
     def parse_known_args(
         self,
@@ -246,6 +256,46 @@ class ArgumentParser(argparse.ArgumentParser):
             return (pargs, unknown_args)
         except ValueError:
             return (ns, [])
+
+    def print_help(self, file: Optional[IO[str]] = None) -> None:
+        print(
+            """mzcompose orchestrates services defined in mzcompose.yml.
+It wraps Docker Compose to add some Materialize-specific features.
+
+Usage:
+  mzcompose [options] COMMAND [ARGS...]
+
+Options:
+  --mz-build-mode <dev|release>
+                     Specify the Cargo profile to use when compiling Rust
+                     crates (default: release)
+  --mz-find DIR      Use the mzcompose.yml file from DIR, rather than the
+                     current directory
+  --mz-quiet         Suppress Materialize-specific informational messages
+  --verbose          Show more output
+
+Commands:
+  build              Build or rebuild services
+  down               Stop and remove containers, networks, images, and volumes
+  gen-shortcuts      Generate shortcut `mzcompose` shell scripts in mzcompose directories
+  lint               Surface common errors in compositions
+  list-compositions  List the directories that contain compositions
+  list-ports SERVICE List any ports exposed by SERVICE
+  list-workflows     List the workflows in the composition
+  ps                 List containers
+  run                Run a one-off command or workflow
+  start              Start services
+  stop               Stop services
+  up                 Create and start containers
+  web SERVICE        Open SERVICE's URL in a web browser
+
+These are only the most common commands. There are additional Docker Compose
+commands that are also supported. Consult `docker-compose help` for the full
+set.
+
+For additional details on mzcompose, consult doc/developer/mzbuild.md.""",
+            file=file,
+        )
 
     def error(self, message: str) -> NoReturn:
         raise ValueError(message)

@@ -136,6 +136,7 @@ where
 
                 let source_config = SourceConfig {
                     name: format!("{}-{}", connector.name(), uid),
+                    upstream_name: connector.upstream_name().map(ToOwned::to_owned),
                     id: uid,
                     scope,
                     // Distribute read responsibility among workers.
@@ -170,7 +171,9 @@ where
                     );
 
                     let reader_schema = match &encoding {
-                        DataEncoding::AvroOcf(AvroOcfEncoding { reader_schema }) => reader_schema,
+                        SourceDataEncoding::Single(DataEncoding::AvroOcf(AvroOcfEncoding {
+                            reader_schema,
+                        })) => reader_schema,
                         _ => unreachable!(
                             "Internal error: \
                                      Avro OCF schema should have already been resolved.\n\
@@ -250,14 +253,19 @@ where
                             .as_collection(),
                     );
 
-                    let (stream, errors) = if let SourceEnvelope::Upsert(key_encoding) = &envelope {
-                        let value_decoder = get_decoder(encoding, &self.debug_name);
-                        let key_decoder = get_decoder(key_encoding.clone(), &self.debug_name);
+                    let (stream, errors) = if let SourceEnvelope::Upsert = &envelope {
+                        let kv_decoder = if let SourceDataEncoding::KeyValue { key, value } =
+                            encoding
+                        {
+                            get_decoder(key, value, &envelope).expect("decoder should be validated")
+                        } else {
+                            panic!("key/value decoding is required for upsert")
+                        };
+
                         super::upsert::decode_stream(
                             &ok_source,
                             self.as_of_frontier.clone(),
-                            key_decoder,
-                            value_decoder,
+                            kv_decoder,
                             &mut linear_operators,
                             src.bare_desc.typ().arity(),
                         )
@@ -296,10 +304,13 @@ where
                         let dbz_key_indices = match &src.connector {
                             SourceConnector::External {
                                 encoding:
-                                    DataEncoding::Avro(AvroEncoding {
-                                        key_schema: Some(key_schema),
+                                    SourceDataEncoding::KeyValue {
+                                        key:
+                                            DataEncoding::Avro(AvroEncoding {
+                                                schema: key_schema, ..
+                                            }),
                                         ..
-                                    }),
+                                    },
                                 ..
                             } => {
                                 let fields = match &src.bare_desc.typ().column_types[0].scalar_type
@@ -353,11 +364,15 @@ where
                         let predicates = std::mem::take(&mut operators.predicates);
                         // The predicates may be temporal, which requires the nuance
                         // of an explicit plan capable of evaluating the predicates.
-                        let filter_plan = crate::FilterPlan::create_from(predicates)
+                        let filter_plan = expr::MapFilterProject::new(source_type.arity())
+                            .filter(predicates)
+                            .into_plan()
                             .unwrap_or_else(|e| panic!("{}", e));
                         move |(input_row, time, diff)| {
+                            let arena = repr::RowArena::new();
                             let mut datums_local = datums.borrow_with(&input_row);
-                            let times_diffs = filter_plan.evaluate(&mut datums_local, time, diff);
+                            let times_diffs =
+                                filter_plan.evaluate(&mut datums_local, &arena, time, diff);
                             // Name the iterator, to capture total size and datums.
                             let iterator = position_or.iter().map(|pos_or| match pos_or {
                                 Some(index) => datums_local[*index],
@@ -369,7 +384,7 @@ where
                             // Each produced (time, diff) results in a copy of `output_row` in the output.
                             // TODO: It would be nice to avoid the `output_row.clone()` for the last output.
                             times_diffs.map(move |time_diff| {
-                                time_diff.map(|(t, d)| (output_row.clone(), t, d))
+                                time_diff.map_err(|(e, t, d)| (DataflowError::from(e), t, d))
                             })
                         }
                     });
@@ -387,7 +402,7 @@ where
 
                 // Apply `as_of` to each timestamp.
                 match &envelope {
-                    SourceEnvelope::Upsert(_) => {}
+                    SourceEnvelope::Upsert => {}
                     _ => {
                         let as_of_frontier1 = self.as_of_frontier.clone();
                         collection = collection
