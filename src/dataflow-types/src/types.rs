@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::ops::Add;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -128,12 +129,14 @@ impl DataflowDesc {
 
     pub fn add_source_import(
         &mut self,
+        name: String,
         id: GlobalId,
         connector: SourceConnector,
         bare_desc: RelationDesc,
         orig_id: GlobalId,
     ) {
         let source_description = SourceDesc {
+            name,
             connector,
             operators: None,
             bare_desc,
@@ -319,7 +322,7 @@ pub enum DataEncoding {
     Protobuf(ProtobufEncoding),
     Csv(CsvEncoding),
     Regex(RegexEncoding),
-    Postgres(RelationDesc),
+    Postgres,
     Bytes,
     Text,
 }
@@ -482,11 +485,20 @@ impl DataEncoding {
             DataEncoding::Text => {
                 key_desc.with_named_column("text", ScalarType::String.nullable(false))
             }
-            DataEncoding::Postgres(desc) => desc.clone(),
+            DataEncoding::Postgres => key_desc
+                .with_named_column("oid", ScalarType::Int32.nullable(false))
+                .with_named_column(
+                    "row_data",
+                    ScalarType::List {
+                        element_type: Box::new(ScalarType::String),
+                        custom_oid: None,
+                    }
+                    .nullable(false),
+                ),
         })
     }
 
-    pub fn op_name(&self) -> &str {
+    pub fn op_name(&self) -> &'static str {
         match self {
             DataEncoding::Bytes => "Bytes",
             DataEncoding::AvroOcf { .. } => "AvroOcf",
@@ -495,7 +507,7 @@ impl DataEncoding {
             DataEncoding::Regex { .. } => "Regex",
             DataEncoding::Csv(_) => "Csv",
             DataEncoding::Text => "Text",
-            DataEncoding::Postgres(_) => "Postgres",
+            DataEncoding::Postgres => "Postgres",
         }
     }
 
@@ -545,6 +557,7 @@ pub struct RegexEncoding {
 /// of the collection.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SourceDesc {
+    pub name: String,
     pub connector: SourceConnector,
     /// Optionally, filtering and projection that may optimistically be applied
     /// to the output of the source.
@@ -729,6 +742,18 @@ impl ExternalSourceConnector {
             _ => false,
         }
     }
+
+    pub fn is_delimited(&self) -> bool {
+        match self {
+            ExternalSourceConnector::AvroOcf(_) => false,
+            ExternalSourceConnector::File(_) => false,
+            ExternalSourceConnector::S3(_) => false,
+            ExternalSourceConnector::Kafka(_) => true,
+            ExternalSourceConnector::Kinesis(_) => true,
+            ExternalSourceConnector::Postgres(_) => true,
+            ExternalSourceConnector::PubNub(_) => true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -748,6 +773,16 @@ pub struct MzOffset {
 impl fmt::Display for MzOffset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.offset)
+    }
+}
+
+impl Add<i64> for MzOffset {
+    type Output = MzOffset;
+
+    fn add(self, x: i64) -> MzOffset {
+        MzOffset {
+            offset: self.offset + x,
+        }
     }
 }
 
@@ -824,10 +859,6 @@ pub struct FileSourceConnector {
 pub struct PostgresSourceConnector {
     pub conn: String,
     pub publication: String,
-    // The table's UnresolvedObjectName.to_ast_string(), for use in literal SQL
-    // strings.
-    pub ast_table: String,
-    pub cast_exprs: Vec<MirScalarExpr>,
     pub slot_name: String,
 }
 
@@ -879,6 +910,7 @@ pub struct KafkaSinkConnector {
     pub addrs: KafkaAddrs,
     pub topic: String,
     pub key_desc_and_indices: Option<(RelationDesc, Vec<usize>)>,
+    pub relation_key_indices: Option<Vec<usize>>,
     pub value_desc: RelationDesc,
     pub key_schema_id: Option<i32>,
     pub value_schema_id: i32,
@@ -911,6 +943,14 @@ impl SinkConnector {
                 .key_desc_and_indices
                 .as_ref()
                 .map(|(_desc, indices)| indices.as_slice()),
+            SinkConnector::Tail(_) => None,
+            SinkConnector::AvroOcf(_) => None,
+        }
+    }
+
+    pub fn get_relation_key_indices(&self) -> Option<&[usize]> {
+        match self {
+            SinkConnector::Kafka(k) => k.relation_key_indices.as_deref(),
             SinkConnector::Tail(_) => None,
             SinkConnector::AvroOcf(_) => None,
         }
@@ -953,9 +993,13 @@ pub struct KafkaSinkConnectorBuilder {
     pub schema_registry_url: Url,
     pub key_schema: Option<String>,
     pub value_schema: String,
+    /// A natural key of the sinked relation (view or source).
+    pub relation_key_indices: Option<Vec<usize>>,
+    /// The user-specified key for the sink.
     pub key_desc_and_indices: Option<(RelationDesc, Vec<usize>)>,
     pub value_desc: RelationDesc,
     pub topic_prefix: String,
+    pub consistency_topic_prefix: Option<String>,
     pub topic_suffix_nonce: String,
     pub partition_count: i32,
     pub replication_factor: i32,

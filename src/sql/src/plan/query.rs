@@ -43,6 +43,7 @@ use sql_parser::ast::{
 };
 
 use ::expr::{GlobalId, Id, RowSetFinishing};
+use repr::adt::apd::APD_DATUM_MAX_PRECISION;
 use repr::adt::decimal::{Decimal, MAX_DECIMAL_PRECISION};
 use repr::{
     strconv, ColumnName, ColumnType, Datum, RelationDesc, RelationType, RowArena, ScalarType,
@@ -63,6 +64,7 @@ use crate::plan::scope::{Scope, ScopeItem, ScopeItemName};
 use crate::plan::statement::StatementContext;
 use crate::plan::transform_ast;
 use crate::plan::typeconv::{self, CastContext};
+use crate::plan::PlanContext;
 
 // Aug is the type variable assigned to an AST that has already been
 // name-resolved. An AST in this state has global IDs populated next to table
@@ -548,6 +550,128 @@ pub fn plan_insert_query(
     }
 
     Ok((table.id(), expr.map(map_exprs).project(project_key)))
+}
+
+pub fn plan_copy_from(
+    scx: &StatementContext,
+    table_name: UnresolvedObjectName,
+    columns: Vec<Ident>,
+) -> Result<(GlobalId, RelationDesc, Vec<usize>), anyhow::Error> {
+    let table = scx.resolve_item(table_name)?;
+
+    // Validate the target of the insert.
+    if table.item_type() != CatalogItemType::Table {
+        bail!(
+            "cannot insert into {} '{}'",
+            table.item_type(),
+            table.name()
+        );
+    }
+    let mut desc = table.desc()?.clone();
+    let _ = table
+        .table_details()
+        .expect("attempted to insert into non-table");
+
+    if table.id().is_system() {
+        bail!("cannot insert into system table '{}'", table.name());
+    }
+
+    let mut ordering = Vec::with_capacity(columns.len());
+
+    if columns.is_empty() {
+        ordering.extend(0..desc.arity());
+    } else {
+        let columns: Vec<_> = columns.into_iter().map(normalize::column_name).collect();
+        let column_by_name: HashMap<&ColumnName, (usize, &ColumnType)> = desc
+            .iter()
+            .filter_map(|(name, typ)| name.map(|n| (n, typ)))
+            .enumerate()
+            .map(|(idx, (name, typ))| (name, (idx, typ)))
+            .collect();
+
+        let mut names = Vec::with_capacity(columns.len());
+        let mut source_types = Vec::with_capacity(columns.len());
+
+        for c in &columns {
+            if let Some((idx, typ)) = column_by_name.get(c) {
+                ordering.push(*idx);
+                source_types.push((*typ).clone());
+                names.push(Some(c.clone()));
+            } else {
+                bail!(
+                    "column {} of relation {} does not exist",
+                    c.as_str().quoted(),
+                    table.name().to_string().quoted()
+                );
+            }
+        }
+        if let Some(dup) = columns.iter().duplicates().next() {
+            bail!("column {} specified more than once", dup.as_str().quoted());
+        }
+
+        desc = RelationDesc::new(RelationType::new(source_types), names);
+    };
+
+    Ok((table.id(), desc, ordering))
+}
+
+/// Builds a plan that adds the default values for the missing columns and re-orders
+/// the datums in the given rows to match the order in the target table.
+pub fn plan_copy_from_rows(
+    catalog: &dyn Catalog,
+    id: GlobalId,
+    columns: Vec<usize>,
+    rows: Vec<repr::Row>,
+) -> Result<HirRelationExpr, anyhow::Error> {
+    let table = catalog.get_item_by_id(&id);
+    let desc = table.desc()?;
+
+    let defaults = table
+        .table_details()
+        .expect("attempted to insert into non-table");
+
+    let column_types = columns
+        .iter()
+        .map(|x| desc.typ().column_types[*x].clone())
+        .map(|mut x| {
+            // Null constraint is enforced later, when inserting the row in the table.
+            // Without this, an assert is hit during lowering.
+            x.nullable = true;
+            x
+        })
+        .collect();
+    let typ = RelationType::new(column_types);
+    let expr = HirRelationExpr::Constant {
+        rows,
+        typ: typ.clone(),
+    };
+
+    // Fill in any omitted columns and rearrange into correct order
+    let mut map_exprs = vec![];
+    let mut project_key = Vec::with_capacity(desc.arity());
+
+    // Maps from table column index to position in the source query
+    let col_to_source: HashMap<_, _> = columns.iter().enumerate().map(|(a, b)| (b, a)).collect();
+
+    let scx = StatementContext {
+        pcx: &PlanContext::default(),
+        catalog,
+        ids: HashSet::new(),
+        param_types: std::rc::Rc::new(RefCell::new(BTreeMap::new())),
+    };
+
+    let column_details = desc.iter_types().zip_eq(defaults).enumerate();
+    for (col_idx, (col_typ, default)) in column_details {
+        if let Some(src_idx) = col_to_source.get(&col_idx) {
+            project_key.push(*src_idx);
+        } else {
+            let (hir, _) = plan_default_expr(&scx, default, &col_typ.scalar_type)?;
+            project_key.push(typ.arity() + map_exprs.len());
+            map_exprs.push(hir);
+        }
+    }
+
+    Ok(expr.map(map_exprs).project(project_key))
 }
 
 struct CastRelationError {
@@ -2968,16 +3092,25 @@ pub fn scalar_type_from_sql(
             };
             match scx.catalog.try_get_lossy_scalar_type_by_id(&item.id()) {
                 Some(t) => match t {
+                    ScalarType::APD { .. } => {
+                        let (_, scale) =
+                            unwrap_numeric_typ_mod(typ_mod, APD_DATUM_MAX_PRECISION as u8, "apd")?;
+                        ScalarType::APD { scale }
+                    }
                     ScalarType::Decimal(..) => {
-                        let (precision, scale) = unwrap_numeric_typ_mod(typ_mod)?;
-                        ScalarType::Decimal(precision, scale)
+                        let (precision, scale) =
+                            unwrap_numeric_typ_mod(typ_mod, MAX_DECIMAL_PRECISION, "numeric")?;
+                        ScalarType::Decimal(
+                            precision.unwrap_or(MAX_DECIMAL_PRECISION),
+                            scale.unwrap_or(0),
+                        )
                     }
                     ScalarType::String => {
                         // TODO(justin): we should look up in the catalog to see
                         // if this type is actually a length-parameterized
                         // string.
                         match name.raw_name().item.as_str() {
-                            n @ "char" | n @ "varchar" => {
+                            n @ "bpchar" | n @ "char" | n @ "varchar" => {
                                 validate_typ_mod(n, &typ_mod, &[("length", 1, 10_485_760)])?
                             }
                             _ => {}
@@ -3004,25 +3137,37 @@ pub fn scalar_type_from_sql(
 ///
 /// Note that this function assumes you have already determined that
 /// `data_type.name` should resolve to `ScalarType::Decimal`.
-pub fn unwrap_numeric_typ_mod(typ_mod: &[u64]) -> Result<(u8, u8), anyhow::Error> {
-    let max_precision = u64::from(MAX_DECIMAL_PRECISION);
+pub fn unwrap_numeric_typ_mod(
+    typ_mod: &[u64],
+    max: u8,
+    name: &str,
+) -> Result<(Option<u8>, Option<u8>), anyhow::Error> {
+    let max_precision = u64::from(max);
     validate_typ_mod(
-        "numeric",
+        name,
         &typ_mod,
         &[("precision", 1, max_precision), ("scale", 0, max_precision)],
     )?;
 
     // Poor man's VecDeque
     let (precision, scale) = match typ_mod.len() {
-        0 => (MAX_DECIMAL_PRECISION, 0),
-        1 => (typ_mod[0] as u8, 0),
-        2 => (typ_mod[0] as u8, typ_mod[1] as u8),
+        0 => (None, None),
+        1 => (Some(typ_mod[0] as u8), None),
+        2 => {
+            let precision = typ_mod[0] as u8;
+            let scale = typ_mod[1] as u8;
+            if scale > precision {
+                bail!(
+                    "{} scale {} must be between 0 and precision {}",
+                    name,
+                    scale,
+                    precision
+                );
+            }
+            (Some(precision), Some(scale))
+        }
         _ => unreachable!(),
     };
-
-    if scale > precision {
-        bail!("numeric scale {} exceeds precision {}", scale, precision);
-    }
 
     Ok((precision, scale))
 }
@@ -3081,7 +3226,7 @@ pub fn scalar_type_from_pg(ty: &pgrepr::Type) -> Result<ScalarType, anyhow::Erro
             value_type: Box::new(scalar_type_from_pg(value_type)?),
             custom_oid: None,
         }),
-        pgrepr::Type::RDN => Ok(ScalarType::Numeric { scale: None }),
+        pgrepr::Type::APD => Ok(ScalarType::APD { scale: None }),
     }
 }
 

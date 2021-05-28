@@ -37,7 +37,9 @@ any
 anyarray
 anyelement
 anynonarray
+apd
 bool
+bpchar
 bytea
 char
 date
@@ -52,7 +54,6 @@ list
 map
 numeric
 oid
-rdn
 record
 text
 time
@@ -86,7 +87,9 @@ any              system
 anyarray         system
 anyelement       system
 anynonarray      system
+apd              system
 bool             system
+bpchar           system
 bytea            system
 char             system
 date             system
@@ -101,7 +104,6 @@ list             system
 map              system
 numeric          system
 oid              system
-rdn              system
 record           system
 text             system
 time             system
@@ -151,6 +153,7 @@ varchar          system
 
 > CREATE TABLE text_t (a text);
 > CREATE TABLE char_t (a char(100));
+> CREATE TABLE bpchar_t (a bpchar(100));
 > CREATE TABLE varchar_t (a varchar(100));
 
 > CREATE TABLE time_t (a time);

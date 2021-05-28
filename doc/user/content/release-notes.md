@@ -46,6 +46,19 @@ Use relative links (/path/to/doc), not absolute links
 Wrap your release notes at the 80 character mark.
 {{< /comment >}}
 
+{{% version-header v0.7.4 %}}
+
+- Add the [`COPY FROM`](/sql/copy-from) statement, which allows populating a
+  table via the PostgreSQL [`COPY` protocol][pg-copy].
+
+- **Breaking change.** Sort `NULL`s last, to match the default sort order in
+  PostgreSQL.
+
+- **Breaking change.** Rename `consistency` parameter to `consistency_topic`
+  for both Kafka sources and sinks. Additionally, change `consistency_topic` on
+  sinks to be a string that specifies a topic name instead of a boolean. This
+  harmonizes the parameter behavior between sources and sinks.
+
 {{% version-header v0.7.3 %}}
 
 - Add the [`pow`](/sql/functions/#numbers-func) function as an alias for the
@@ -61,7 +74,7 @@ Wrap your release notes at the 80 character mark.
 - **Breaking change.** Change the default for the `enable_auto_commit` option
   on [Kafka sources](/sql/create-source/avro-kafka) to `false`.
 
-- Support the [equality operator](/sql/functions/#boolean) on
+- Support [equality operators](/sql/functions/#boolean) on
   [array data](/sql/types/array).
 
 {{% version-header v0.7.2 %}}

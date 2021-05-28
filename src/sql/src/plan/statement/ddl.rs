@@ -49,9 +49,9 @@ use crate::ast::{
     ColumnOption, Compression, Connector, CreateDatabaseStatement, CreateIndexStatement,
     CreateRoleOption, CreateRoleStatement, CreateSchemaStatement, CreateSinkStatement,
     CreateSourceStatement, CreateTableStatement, CreateTypeAs, CreateTypeStatement,
-    CreateViewStatement, DataType, DbzMode, DropDatabaseStatement, DropObjectsStatement, Envelope,
-    Expr, Format, Ident, IfExistsBehavior, ObjectType, Raw, SqlOption, Statement,
-    UnresolvedObjectName, Value, WithOption,
+    CreateViewStatement, CreateViewsDefinitions, CreateViewsStatement, DataType, DbzMode,
+    DropDatabaseStatement, DropObjectsStatement, Envelope, Expr, Format, Ident, IfExistsBehavior,
+    ObjectType, Raw, SqlOption, Statement, UnresolvedObjectName, Value, ViewDefinition, WithOption,
 };
 use crate::catalog::{CatalogItem, CatalogItemType};
 use crate::kafka_util;
@@ -59,17 +59,15 @@ use crate::names::{DatabaseSpecifier, FullName, SchemaName};
 use crate::normalize;
 use crate::plan::error::PlanError;
 use crate::plan::expr::{ColumnRef, HirScalarExpr, JoinKind};
-use crate::plan::query::{resolve_names_data_type, ExprContext, QueryLifetime};
-use crate::plan::scope::Scope;
+use crate::plan::query::{resolve_names_data_type, QueryLifetime};
 use crate::plan::statement::{StatementContext, StatementDesc};
-use crate::plan::typeconv::{plan_hypothetical_cast, CastContext};
 use crate::plan::{
     self, plan_utils, query, AlterIndexResetOptionsPlan, AlterIndexSetOptionsPlan,
     AlterItemRenamePlan, AlterNoopPlan, CreateDatabasePlan, CreateIndexPlan, CreateRolePlan,
     CreateSchemaPlan, CreateSinkPlan, CreateSourcePlan, CreateTablePlan, CreateTypePlan,
-    CreateViewPlan, DropDatabasePlan, DropItemsPlan, DropRolesPlan, DropSchemaPlan,
-    HirRelationExpr, Index, IndexOption, IndexOptionName, Params, Plan, QueryContext, Sink, Source,
-    Table, Type, TypeInner, View,
+    CreateViewPlan, CreateViewsPlan, DropDatabasePlan, DropItemsPlan, DropRolesPlan,
+    DropSchemaPlan, HirRelationExpr, Index, IndexOption, IndexOptionName, Params, Plan, Sink,
+    Source, Table, Type, TypeInner, View,
 };
 use crate::pure::Schema;
 
@@ -372,6 +370,7 @@ fn plan_source_envelope(
             bare_desc.iter_names().map(|name| name.cloned()).collect(),
         )
     };
+
     let mir_expr = hir_expr.lower();
 
     Ok((mir_expr, column_names))
@@ -564,10 +563,10 @@ pub fn plan_create_source(
         Connector::Kafka { broker, topic, .. } => {
             let config_options = kafka_util::extract_config(&mut with_options)?;
 
-            consistency = match with_options.remove("consistency") {
+            consistency = match with_options.remove("consistency_topic") {
                 None => Consistency::RealTime,
                 Some(Value::String(topic)) => Consistency::BringYourOwn(topic),
-                Some(_) => bail!("consistency must be a string"),
+                Some(_) => bail!("consistency_topic must be a string"),
             };
 
             let group_id_prefix = match with_options.remove("group_id_prefix") {
@@ -581,10 +580,6 @@ pub fn plan_create_source(
                 &mut with_options,
             )?;
 
-            // THIS IS EXPERIMENTAL - DO NOT DOCUMENT IT
-            // until we have had time to think about what the right UX/design is on a non-urgent timeline!
-            // By using this feature, you are opting in to not using updates or deletes in CDC sources, and
-            // accepting panics if that constraint is violated.
             if with_options.contains_key("start_offset") && consistency != Consistency::RealTime {
                 bail!("`start_offset` is not yet implemented for non-realtime consistency sources.")
             }
@@ -676,7 +671,7 @@ pub fn plan_create_source(
                 Some(Value::Boolean(b)) => b,
                 Some(_) => bail!("tail must be a boolean"),
             };
-            consistency = match with_options.remove("consistency") {
+            consistency = match with_options.remove("consistency_topic") {
                 None => Consistency::RealTime,
                 Some(_) => bail!("BYO consistency not supported for file sources"),
             };
@@ -741,8 +736,6 @@ pub fn plan_create_source(
         Connector::Postgres {
             conn,
             publication,
-            table,
-            columns,
             slot,
         } => {
             scx.require_experimental_mode("Postgres Sources")?;
@@ -751,77 +744,13 @@ pub fn plan_create_source(
                 .as_ref()
                 .ok_or_else(|| anyhow!("Postgres sources must provide a slot name"))?;
 
-            let qcx = QueryContext::root(scx, QueryLifetime::Static);
-            let cast_desc = RelationDesc::empty();
-            let ecx = ExprContext {
-                qcx: &qcx,
-                name: "postgres column cast",
-                scope: &Scope::empty(None),
-                relation_type: &cast_desc.typ(),
-                allow_aggregates: false,
-                allow_subqueries: true,
-            };
-
-            // Build the expected relation description
-            let col_names: Vec<_> = columns
-                .iter()
-                .map(|c| Some(normalize::column_name(c.name.clone())))
-                .collect();
-
-            let mut col_types = vec![];
-            let mut key_cols = vec![];
-            let mut cast_exprs = vec![];
-            for (i, c) in columns.iter().enumerate() {
-                if let Some(collation) = &c.collation {
-                    unsupported!(format!(
-                        "CREATE SOURCE FROM POSTGRES with column collation: {}",
-                        collation
-                    ));
-                }
-
-                let (aug_data_type, _ids) = resolve_names_data_type(scx, c.data_type.clone())?;
-                let scalar_ty = plan::scalar_type_from_sql(scx, &aug_data_type)?;
-
-                let mut nullable = true;
-                for option in &c.options {
-                    match &option.option {
-                        ColumnOption::Null => (),
-                        ColumnOption::NotNull => nullable = false,
-                        ColumnOption::Unique { is_primary: true } => key_cols.push(i),
-                        other => unsupported!(format!(
-                            "CREATE SOURCE FROM POSTGRES with column constraint: {}",
-                            other
-                        )),
-                    }
-                }
-
-                let cast_expr = plan_hypothetical_cast(
-                    &ecx,
-                    CastContext::Explicit,
-                    &ScalarType::String,
-                    &scalar_ty,
-                )
-                .unwrap();
-
-                col_types.push(scalar_ty.nullable(nullable));
-                cast_exprs.push(cast_expr);
-            }
-
-            let typ = if key_cols.is_empty() {
-                RelationType::new(col_types)
-            } else {
-                RelationType::new(col_types).with_key(key_cols)
-            };
-            let desc = RelationDesc::new(typ, col_names);
             let connector = ExternalSourceConnector::Postgres(PostgresSourceConnector {
                 conn: conn.clone(),
                 publication: publication.clone(),
-                ast_table: table.to_ast_string(),
-                cast_exprs,
                 slot_name: slot_name.clone(),
             });
 
-            let encoding = SourceDataEncoding::Single(DataEncoding::Postgres(desc));
+            let encoding = SourceDataEncoding::Single(DataEncoding::Postgres);
             (connector, encoding)
         }
         Connector::PubNub {
@@ -844,16 +773,14 @@ pub fn plan_create_source(
                 Some(Value::Boolean(b)) => b,
                 Some(_) => bail!("tail must be a boolean"),
             };
-            consistency = match with_options.remove("consistency") {
+            consistency = match with_options.remove("consistency_topic") {
                 None => Consistency::RealTime,
                 Some(Value::String(topic)) => Consistency::BringYourOwn(topic),
-                Some(_) => bail!("consistency must be a string"),
+                Some(_) => bail!("consistency_topic must be a string"),
             };
 
-            if consistency != Consistency::RealTime
-                && *envelope != sql_parser::ast::Envelope::Debezium(sql_parser::ast::DbzMode::Plain)
-            {
-                bail!("BYO consistency only supported for Debezium Avro OCF sources");
+            if consistency != Consistency::RealTime {
+                bail!("BYO consistency is not supported for Avro OCF sources");
             }
 
             ts_frequency = extract_timestamp_frequency_option(
@@ -902,6 +829,14 @@ pub fn plan_create_source(
     let envelope = match &envelope {
         sql_parser::ast::Envelope::None => SourceEnvelope::None,
         sql_parser::ast::Envelope::Debezium(mode) => {
+            let is_avro = match encoding.value_ref() {
+                DataEncoding::Avro(_) => true,
+                DataEncoding::AvroOcf(_) => true,
+                _ => false,
+            };
+            if !is_avro {
+                bail!("non-Avro Debezium sources are not supported");
+            }
             let dedup_strat = match with_options.remove("deduplication") {
                 None => match mode {
                     sql_parser::ast::DbzMode::Plain => DebeziumDeduplicationStrategy::Ordered,
@@ -1102,13 +1037,16 @@ pub fn plan_create_view(
 ) -> Result<Plan, anyhow::Error> {
     let create_sql = normalize::create_statement(scx, Statement::CreateView(stmt.clone()))?;
     let CreateViewStatement {
-        name,
-        columns,
-        query,
         temporary,
         materialized,
         if_exists,
-        with_options,
+        definition:
+            ViewDefinition {
+                name,
+                columns,
+                query,
+                with_options,
+            },
     } = &mut stmt;
     if !with_options.is_empty() {
         unsupported!("WITH options");
@@ -1163,12 +1101,47 @@ pub fn plan_create_view(
     }))
 }
 
+pub fn describe_create_views(
+    _: &StatementContext,
+    _: CreateViewsStatement<Raw>,
+) -> Result<StatementDesc, anyhow::Error> {
+    Ok(StatementDesc::new(None))
+}
+
+pub fn plan_create_views(
+    scx: &StatementContext,
+    stmt: CreateViewsStatement<Raw>,
+) -> Result<Plan, anyhow::Error> {
+    match stmt.definitions {
+        CreateViewsDefinitions::Literal(view_definitions) => {
+            let mut planned_views = Vec::with_capacity(view_definitions.len());
+            for definition in view_definitions {
+                let view = CreateViewStatement {
+                    temporary: stmt.temporary,
+                    materialized: stmt.materialized,
+                    if_exists: stmt.if_exists,
+                    definition,
+                };
+                match plan_create_view(scx, view, &Params::empty())? {
+                    Plan::CreateView(plan) => planned_views.push(plan),
+                    _ => unreachable!(),
+                }
+            }
+            Ok(Plan::CreateViews(CreateViewsPlan {
+                views: planned_views,
+            }))
+        }
+        CreateViewsDefinitions::Source { .. } => bail!("cannot create view from source"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn kafka_sink_builder(
     format: Option<Format<Raw>>,
     with_options: &mut BTreeMap<String, Value>,
     broker: String,
     topic_prefix: String,
+    relation_key_indices: Option<Vec<usize>>,
     key_desc_and_indices: Option<(RelationDesc, Vec<usize>)>,
     value_desc: RelationDesc,
     topic_suffix_nonce: String,
@@ -1190,10 +1163,10 @@ fn kafka_sink_builder(
 
     let broker_addrs = broker.parse()?;
 
-    let include_consistency = match with_options.remove("consistency") {
-        Some(Value::Boolean(b)) => b,
-        None => false,
-        Some(_) => bail!("consistency must be a boolean"),
+    let consistency_topic = match with_options.remove("consistency_topic") {
+        None => None,
+        Some(Value::String(topic)) => Some(topic),
+        Some(_) => bail!("consistency_topic must be a string"),
     };
 
     let exactly_once = match with_options.remove("exactly_once") {
@@ -1202,7 +1175,7 @@ fn kafka_sink_builder(
         Some(_) => bail!("exactly-once must be a boolean"),
     };
 
-    if exactly_once && !include_consistency {
+    if exactly_once && consistency_topic.is_none() {
         bail!("exactly-once requires a consistency topic");
     }
 
@@ -1229,7 +1202,7 @@ fn kafka_sink_builder(
             .as_ref()
             .map(|(desc, _indices)| desc.clone()),
         value_desc.clone(),
-        include_consistency,
+        consistency_topic.is_some(),
     );
     let value_schema = encoder.value_writer_schema().to_string();
     let key_schema = encoder
@@ -1262,11 +1235,9 @@ fn kafka_sink_builder(
         );
     }
 
-    let consistency_value_schema = if include_consistency {
-        Some(avro::get_debezium_transaction_schema().canonical_form())
-    } else {
-        None
-    };
+    let consistency_value_schema = consistency_topic
+        .as_ref()
+        .map(|_topic| avro::get_debezium_transaction_schema().canonical_form());
 
     let config_options = kafka_util::extract_config(with_options)?;
     let ccsr_config = kafka_util::generate_ccsr_client_config(
@@ -1274,11 +1245,13 @@ fn kafka_sink_builder(
         &config_options,
         ccsr_with_options,
     )?;
+
     Ok(SinkConnectorBuilder::Kafka(KafkaSinkConnectorBuilder {
         broker_addrs,
         schema_registry_url,
         value_schema,
         topic_prefix,
+        consistency_topic_prefix: consistency_topic,
         topic_suffix_nonce,
         partition_count,
         replication_factor,
@@ -1287,6 +1260,7 @@ fn kafka_sink_builder(
         config_options,
         ccsr_config,
         key_schema,
+        relation_key_indices,
         key_desc_and_indices,
         value_desc,
         exactly_once,
@@ -1375,10 +1349,10 @@ pub fn plan_create_sink(
                     }
                 }
                 let indices = key
-                    .into_iter()
+                    .iter()
                     .map(|col| -> anyhow::Result<usize> {
                         let name_idx = desc
-                            .get_by_name(&col)
+                            .get_by_name(col)
                             .map(|(idx, _type)| idx)
                             .ok_or_else(|| anyhow!("No such column: {}", col))?;
                         if desc.get_unambiguous_name(name_idx).is_none() {
@@ -1387,6 +1361,13 @@ pub fn plan_create_sink(
                         Ok(name_idx)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                let is_valid_key =
+                    desc.typ().keys.iter().any(|key_columns| {
+                        key_columns.iter().all(|column| indices.contains(column))
+                    });
+                if !is_valid_key && envelope == SinkEnvelope::Upsert {
+                    return Err(invalid_upsert_key_err(&desc, &key));
+                }
                 Some(indices)
             } else {
                 None
@@ -1398,6 +1379,9 @@ pub fn plan_create_sink(
         Connector::Postgres { .. } => None,
         Connector::PubNub { .. } => None,
     };
+
+    // pick the first valid natural relation key, if any
+    let relation_key_indices = desc.typ().keys.get(0).cloned();
 
     let key_desc_and_indices = key_indices.map(|key_indices| {
         let cols = desc.clone().into_iter().collect::<Vec<_>>();
@@ -1435,6 +1419,7 @@ pub fn plan_create_sink(
             &mut with_options,
             broker,
             topic,
+            relation_key_indices,
             key_desc_and_indices,
             value_desc,
             suffix_nonce,
@@ -1468,6 +1453,32 @@ pub fn plan_create_sink(
         if_not_exists,
         depends_on,
     }))
+}
+
+fn invalid_upsert_key_err(desc: &RelationDesc, requested_user_key: &[ColumnName]) -> anyhow::Error {
+    let requested_user_key = requested_user_key
+        .iter()
+        .map(|column| column.as_str())
+        .join(", ");
+    let requested_user_key = format!("({})", requested_user_key);
+    let valid_keys = if desc.typ().keys.is_empty() {
+        "there are no valid keys".to_owned()
+    } else {
+        let valid_keys = desc
+            .typ()
+            .keys
+            .iter()
+            .map(|key_columns| {
+                let columns_string = key_columns
+                    .iter()
+                    .map(|col| desc.get_name(*col).expect("known to exist").as_str())
+                    .join(", ");
+                format!("({})", columns_string)
+            })
+            .join(", ");
+        format!("valid keys are: {}", valid_keys)
+    };
+    anyhow!("Invalid upsert key: {}, {}", requested_user_key, valid_keys)
 }
 
 /// Returns only those `CatalogItem`s that don't have any other user

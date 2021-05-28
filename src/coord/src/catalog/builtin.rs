@@ -416,11 +416,17 @@ pub const TYPE_INT2_ARRAY: BuiltinType = BuiltinType {
     pgtype: &postgres_types::Type::INT2_ARRAY,
 };
 
+pub const TYPE_BPCHAR: BuiltinType = BuiltinType {
+    schema: PG_CATALOG_SCHEMA,
+    id: GlobalId::System(1042),
+    pgtype: &postgres_types::Type::BPCHAR,
+};
+
 lazy_static! {
-    pub static ref TYPE_RDN: BuiltinType = BuiltinType {
+    pub static ref TYPE_APD: BuiltinType = BuiltinType {
         schema: PG_CATALOG_SCHEMA,
         id: GlobalId::System(1997),
-        pgtype: &pgrepr::RDNType,
+        pgtype: &pgrepr::APDType,
     };
     pub static ref TYPE_LIST: BuiltinType = BuiltinType {
         schema: PG_CATALOG_SCHEMA,
@@ -600,6 +606,7 @@ lazy_static! {
         desc: RelationDesc::empty()
             .with_named_column("sink_id", ScalarType::String.nullable(false))
             .with_named_column("topic", ScalarType::String.nullable(false))
+            .with_named_column("consistency_topic", ScalarType::String.nullable(true))
             .with_key(vec![0]),
         id: GlobalId::System(4005),
         index_id: GlobalId::System(4006),
@@ -1274,6 +1281,7 @@ lazy_static! {
             Builtin::Type(&TYPE_BOOL_ARRAY),
             Builtin::Type(&TYPE_BYTEA),
             Builtin::Type(&TYPE_BYTEA_ARRAY),
+            Builtin::Type(&TYPE_BPCHAR),
             Builtin::Type(&TYPE_CHAR),
             Builtin::Type(&TYPE_DATE),
             Builtin::Type(&TYPE_DATE_ARRAY),
@@ -1289,7 +1297,7 @@ lazy_static! {
             Builtin::Type(&TYPE_INTERVAL_ARRAY),
             Builtin::Type(&TYPE_JSONB),
             Builtin::Type(&TYPE_JSONB_ARRAY),
-            Builtin::Type(&TYPE_RDN),
+            Builtin::Type(&TYPE_APD),
             Builtin::Type(&TYPE_LIST),
             Builtin::Type(&TYPE_MAP),
             Builtin::Type(&TYPE_NUMERIC),

@@ -9,30 +9,25 @@
 
 use std::convert::TryInto;
 use std::error::Error;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use futures::StreamExt;
-use itertools::Itertools;
 use lazy_static::lazy_static;
 
 use postgres_protocol::message::backend::{
     LogicalReplicationMessage, ReplicationMessage, Tuple, TupleData,
 };
-use tokio_postgres::binary_copy::BinaryCopyOutStream;
 use tokio_postgres::config::{Config, ReplicationMode};
 use tokio_postgres::error::{DbError, Severity, SqlState};
 use tokio_postgres::replication::LogicalReplicationStream;
-use tokio_postgres::types::{PgLsn, Type as PgType};
-use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
-use uuid::Uuid;
+use tokio_postgres::types::PgLsn;
+use tokio_postgres::{Client, SimpleQueryMessage};
 
 use crate::source::{SimpleSource, SourceError, Timestamper};
-use dataflow_types::PostgresSourceConnector;
-use postgres_util::TableInfo;
-use repr::{Datum, Row, RowArena};
+use dataflow_types::{PostgresSourceConnector, SourceErrorDetails};
+use repr::{Datum, Row};
 
 lazy_static! {
     /// Postgres epoch is 2000-01-01T00:00:00Z
@@ -41,6 +36,8 @@ lazy_static! {
 
 /// Information required to sync data from Postgres
 pub struct PostgresSourceReader {
+    /// Used to produce useful error messages
+    source_name: String,
     connector: PostgresSourceConnector,
     /// Our cursor into the WAL
     lsn: PgLsn,
@@ -70,8 +67,9 @@ macro_rules! try_recoverable {
 
 impl PostgresSourceReader {
     /// Constructs a new instance
-    pub fn new(connector: PostgresSourceConnector) -> Self {
+    pub fn new(source_name: String, connector: PostgresSourceConnector) -> Self {
         Self {
+            source_name,
             connector,
             lsn: 0.into(),
         }
@@ -80,10 +78,10 @@ impl PostgresSourceReader {
     /// Starts a replication connection to the upstream database
     async fn connect_replication(&self) -> Result<Client, anyhow::Error> {
         let mut config: Config = self.connector.conn.parse()?;
-
+        let tls = postgres_util::make_tls(&config)?;
         let (client, conn) = config
             .replication_mode(ReplicationMode::Logical)
-            .connect(NoTls)
+            .connect(tls)
             .await?;
         tokio::spawn(conn);
         Ok(client)
@@ -93,11 +91,7 @@ impl PostgresSourceReader {
     ///
     /// After the initial snapshot has been produced it returns the name of the created slot and
     /// the LSN at which we should start the replication stream at.
-    async fn produce_snapshot(
-        &mut self,
-        table_info: &TableInfo,
-        timestamper: &Timestamper,
-    ) -> Result<(), anyhow::Error> {
+    async fn produce_snapshot(&mut self, timestamper: &Timestamper) -> Result<(), anyhow::Error> {
         let client = self.connect_replication().await?;
 
         // We're initialising this source so any previously existing slot must be removed and
@@ -108,6 +102,11 @@ impl PostgresSourceReader {
                 &self.connector.slot_name
             ))
             .await;
+
+        // Get all the relevant tables for this publication
+        let publication_tables =
+            postgres_util::publication_info(&self.connector.conn, &self.connector.publication)
+                .await?;
 
         // Start a transaction and immediatelly create a replication slot with the USE SNAPSHOT
         // directive. This makes the starting point of the slot and the snapshot of the transaction
@@ -138,47 +137,29 @@ impl PostgresSourceReader {
             .parse()
             .or_else(|_| Err(anyhow!("invalid lsn")))?;
 
-        let copy_query = format!(
-            r#"COPY {} TO STDOUT WITH (FORMAT binary);"#,
-            self.connector.ast_table,
-        );
-
-        let stream = client.copy_out_simple(&copy_query).await?;
-
-        let scalar_types = table_info
-            .schema
-            .iter()
-            .map(|c| c.scalar_type.clone())
-            .collect_vec();
-
-        let rows = BinaryCopyOutStream::new(stream, &scalar_types);
-        tokio::pin!(rows);
-
         let snapshot_tx = timestamper.start_tx().await;
-        while let Some(row) = rows.next().await.transpose()? {
-            let mut mz_row = Row::default();
-            for (i, ty) in table_info.schema.iter().enumerate() {
-                let datum: Datum = match ty.scalar_type {
-                    PgType::BOOL => row.get::<Option<bool>>(i).into(),
-                    PgType::INT4 => row.get::<Option<i32>>(i).into(),
-                    PgType::INT8 => row.get::<Option<i64>>(i).into(),
-                    PgType::FLOAT4 => row.get::<Option<f32>>(i).into(),
-                    PgType::FLOAT8 => row.get::<Option<f64>>(i).into(),
-                    PgType::DATE => row.get::<Option<NaiveDate>>(i).into(),
-                    PgType::TIME => row.get::<Option<NaiveTime>>(i).into(),
-                    PgType::TIMESTAMP => row.get::<Option<NaiveDateTime>>(i).into(),
-                    PgType::TEXT => row.get::<Option<&str>>(i).into(),
-                    PgType::UUID => row.get::<Option<Uuid>>(i).into(),
-                    ref other => bail!("Unsupported data type {:?}", other),
-                };
 
-                if !ty.nullable && datum.is_null() {
-                    bail!("Got null value in non nullable column");
+        for info in publication_tables {
+            // TODO(petrosagg): use a COPY statement here for more efficient network transfer
+            let data = client
+                .simple_query(&format!(
+                    "SELECT * FROM {:?}.{:?}",
+                    info.namespace, info.name
+                ))
+                .await?;
+
+            for msg in data {
+                if let SimpleQueryMessage::Row(row) = msg {
+                    let mut mz_row = Row::default();
+                    let rel_id: Datum = (info.rel_id as i32).into();
+                    mz_row.push(rel_id);
+                    mz_row.push_list((0..row.len()).map(|n| {
+                        let a: Datum = row.get(n).into();
+                        a
+                    }));
+                    snapshot_tx.insert(mz_row).await?;
                 }
-                mz_row.push(datum);
             }
-
-            snapshot_tx.insert(mz_row).await?;
         }
 
         client.simple_query("COMMIT;").await?;
@@ -188,32 +169,28 @@ impl PostgresSourceReader {
     /// Converts a Tuple received in the replication stream into a Row instance. The logical
     /// replication protocol doesn't use the binary encoding for column values so contrary to the
     /// initial snapshot here we need to parse the textual form of each column.
-    fn row_from_tuple(&mut self, tuple: &Tuple) -> Result<Row, anyhow::Error> {
+    fn row_from_tuple(&mut self, rel_id: u32, tuple: &Tuple) -> Result<Row, anyhow::Error> {
         let mut row = Row::default();
-        let arena = RowArena::new();
 
-        for (val, cast_expr) in tuple
-            .tuple_data()
-            .iter()
-            .zip(self.connector.cast_exprs.iter())
-        {
-            let datum = match val {
-                TupleData::Null => Datum::Null,
-                TupleData::UnchangedToast => bail!("Unsupported TOAST value"),
-                TupleData::Text(b) => {
-                    let txt_datum: Datum = std::str::from_utf8(&b)?.into();
-                    cast_expr.eval(&[txt_datum], &arena)?
-                }
-            };
-            row.push(datum);
-        }
+        let rel_id: Datum = (rel_id as i32).into();
+        row.push(rel_id);
+        row.push_list_with(|packer| {
+            for val in tuple.tuple_data() {
+                let datum = match val {
+                    TupleData::Null => Datum::Null,
+                    TupleData::UnchangedToast => bail!("Unsupported TOAST value"),
+                    TupleData::Text(b) => std::str::from_utf8(&b)?.into(),
+                };
+                packer.push(datum);
+            }
+            Ok(())
+        })?;
 
         Ok(row)
     }
 
     async fn produce_replication(
         &mut self,
-        table_info: &TableInfo,
         timestamper: &Timestamper,
     ) -> Result<(), ReplicationError> {
         use ReplicationError::*;
@@ -232,11 +209,38 @@ impl PostgresSourceReader {
         let stream = LogicalReplicationStream::new(copy_stream);
         tokio::pin!(stream);
 
+        let mut last_keepalive = Instant::now();
         let mut inserts = vec![];
         let mut deletes = vec![];
         while let Some(item) = stream.next().await {
+            use ReplicationMessage::*;
+            // The upstream will periodically request keepalive responses by setting the reply field
+            // to 1. However, we cannot rely on these messages arriving on time. For example, when
+            // the upstream is sending a big transaction its keepalive messages are queued and can
+            // be delayed arbitrarily.  Therefore, we also make sure to send a proactive keepalive
+            // every 30 seconds.
+            //
+            // See: https://www.postgresql.org/message-id/CAMsr+YE2dSfHVr7iEv1GSPZihitWX-PMkD9QALEGcTYa+sdsgg@mail.gmail.com
+            if matches!(item, Ok(PrimaryKeepAlive(ref k)) if k.reply() == 1)
+                || last_keepalive.elapsed() > Duration::from_secs(30)
+            {
+                let ts: i64 = PG_EPOCH
+                    .elapsed()
+                    .expect("system clock set earlier than year 2000!")
+                    .as_micros()
+                    .try_into()
+                    .expect("software more than 200k years old, consider updating");
+
+                try_recoverable!(
+                    stream
+                        .as_mut()
+                        .standby_status_update(self.lsn, self.lsn, self.lsn, ts, 0)
+                        .await
+                );
+                last_keepalive = Instant::now();
+            }
             match item {
-                Ok(ReplicationMessage::XLogData(xlog_data)) => {
+                Ok(XLogData(xlog_data)) => {
                     use LogicalReplicationMessage::*;
 
                     match xlog_data.data() {
@@ -247,30 +251,29 @@ impl PostgresSourceReader {
                                 )));
                             }
                         }
-                        // The replication stream might include data from other tables in the
-                        // publication, so we ignore them
-                        Insert(event) if event.rel_id() != table_info.rel_id => continue,
-                        Update(event) if event.rel_id() != table_info.rel_id => continue,
-                        Delete(event) if event.rel_id() != table_info.rel_id => continue,
                         Insert(insert) => {
-                            let row = try_fatal!(self.row_from_tuple(insert.tuple()));
+                            let rel_id = insert.rel_id();
+                            let row = try_fatal!(self.row_from_tuple(rel_id, insert.tuple()));
                             inserts.push(row);
                         }
                         Update(update) => {
+                            let rel_id = update.rel_id();
                             let old_tuple = try_fatal!(update
                                 .old_tuple()
-                                .ok_or_else(|| anyhow!("full row missisng from update")));
-                            let old_row = try_fatal!(self.row_from_tuple(old_tuple));
+                                .ok_or_else(|| anyhow!("full row missing from update")));
+                            let old_row = try_fatal!(self.row_from_tuple(rel_id, old_tuple));
                             deletes.push(old_row);
 
-                            let new_row = try_fatal!(self.row_from_tuple(update.new_tuple()));
+                            let new_row =
+                                try_fatal!(self.row_from_tuple(rel_id, update.new_tuple()));
                             inserts.push(new_row);
                         }
                         Delete(delete) => {
+                            let rel_id = delete.rel_id();
                             let old_tuple = try_fatal!(delete
                                 .old_tuple()
-                                .ok_or_else(|| anyhow!("full row missisng from delete")));
-                            let row = try_fatal!(self.row_from_tuple(old_tuple));
+                                .ok_or_else(|| anyhow!("full row missing from delete")));
+                            let row = try_fatal!(self.row_from_tuple(rel_id, old_tuple));
                             deletes.push(row);
                         }
                         Commit(commit) => {
@@ -292,28 +295,8 @@ impl PostgresSourceReader {
                         _ => return Err(Fatal(anyhow!("unexpected logical replication message"))),
                     }
                 }
-                // The upstream will periodically send keepalive messages to:
-                //    a) keep the TCP connection alive
-                //    b) get feedback about the state of replication in the replica
-                // The upstream database can dictate if a reply MUST be given by setting the reply
-                // field to 1
-                Ok(ReplicationMessage::PrimaryKeepAlive(keepalive)) => {
-                    if keepalive.reply() == 1 {
-                        let ts: i64 = PG_EPOCH
-                            .elapsed()
-                            .expect("system clock set earlier than year 2000!")
-                            .as_micros()
-                            .try_into()
-                            .expect("software more than 200k years old, consider updating");
-
-                        try_recoverable!(
-                            stream
-                                .as_mut()
-                                .standby_status_update(self.lsn, self.lsn, self.lsn, ts, 0)
-                                .await
-                        );
-                    }
-                }
+                // Handled above
+                Ok(PrimaryKeepAlive(_)) => {}
                 Err(err) => {
                     let recoverable = match err.source() {
                         Some(err) => {
@@ -333,8 +316,13 @@ impl PostgresSourceReader {
                                 None => err.is::<std::io::Error>(),
                             }
                         }
-                        // Closed connection error
-                        None => err.is_closed(),
+                        // We have no information about what happened, it might be a fatal error or
+                        // it might not. Unexpected errors can happen if the upstream crashes for
+                        // example in which case we should retry.
+                        //
+                        // Therefore, we adopt a "recoverable unless proven otherwise" policy and
+                        // keep retrying in the event of unexpected errors.
+                        None => true,
                     };
 
                     if recoverable {
@@ -355,22 +343,26 @@ impl PostgresSourceReader {
 impl SimpleSource for PostgresSourceReader {
     /// The top-level control of the state machine and retry logic
     async fn start(mut self, timestamper: &Timestamper) -> Result<(), SourceError> {
-        let table_info = postgres_util::table_info(&self.connector.conn, &self.connector.ast_table)
-            .await
-            .map_err(|e| SourceError::FileIO(e.to_string()))?;
-
         // The initial snapshot has no easy way of retrying it in case of connection failures
-        self.produce_snapshot(&table_info, timestamper)
+        self.produce_snapshot(timestamper)
             .await
-            .map_err(|e| SourceError::FileIO(e.to_string()))?;
+            .map_err(|e| SourceError {
+                source_name: self.source_name.clone(),
+                error: SourceErrorDetails::Initialization(e.to_string()),
+            })?;
 
         loop {
-            match self.produce_replication(&table_info, timestamper).await {
+            match self.produce_replication(timestamper).await {
                 Ok(_) => log::info!("replication interrupted with no error"),
                 Err(ReplicationError::Recoverable(e)) => {
                     log::info!("replication interrupted: {}", e)
                 }
-                Err(ReplicationError::Fatal(e)) => return Err(SourceError::FileIO(e.to_string())),
+                Err(ReplicationError::Fatal(e)) => {
+                    return Err(SourceError {
+                        source_name: self.source_name,
+                        error: SourceErrorDetails::FileIO(e.to_string()),
+                    })
+                }
             }
 
             // TODO(petrosagg): implement exponential back-off

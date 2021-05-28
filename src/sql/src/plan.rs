@@ -59,7 +59,7 @@ pub use query::{
     plan_default_expr, resolve_names, resolve_names_data_type, resolve_names_stmt,
     scalar_type_from_sql, unwrap_numeric_typ_mod, Aug, QueryContext, QueryLifetime,
 };
-pub use statement::{describe, plan, StatementContext, StatementDesc};
+pub use statement::{describe, plan, plan_copy_from, StatementContext, StatementDesc};
 
 /// Instructions for executing a SQL query.
 #[derive(Debug)]
@@ -71,6 +71,7 @@ pub enum Plan {
     CreateSink(CreateSinkPlan),
     CreateTable(CreateTablePlan),
     CreateView(CreateViewPlan),
+    CreateViews(CreateViewsPlan),
     CreateIndex(CreateIndexPlan),
     CreateType(CreateTypePlan),
     DiscardTemp,
@@ -89,6 +90,7 @@ pub enum Plan {
     Peek(PeekPlan),
     Tail(TailPlan),
     SendRows(SendRowsPlan),
+    CopyFrom(CopyFromPlan),
     Explain(ExplainPlan),
     SendDiffs(SendDiffsPlan),
     Insert(InsertPlan),
@@ -154,6 +156,11 @@ pub struct CreateViewPlan {
     pub materialize: bool,
     pub if_not_exists: bool,
     pub depends_on: Vec<GlobalId>,
+}
+
+#[derive(Debug)]
+pub struct CreateViewsPlan {
+    pub views: Vec<CreateViewPlan>,
 }
 
 #[derive(Debug)]
@@ -226,6 +233,13 @@ pub struct TailPlan {
 #[derive(Debug)]
 pub struct SendRowsPlan {
     pub rows: Vec<Row>,
+}
+
+#[derive(Debug)]
+pub struct CopyFromPlan {
+    pub id: GlobalId,
+    pub columns: Vec<usize>,
+    pub params: CopyParams,
 }
 
 #[derive(Debug)]
@@ -373,6 +387,13 @@ pub enum CopyFormat {
     Text,
     Csv,
     Binary,
+}
+
+#[derive(Debug)]
+pub struct CopyParams {
+    pub format: CopyFormat,
+    pub null: Option<String>,
+    pub delimiter: Option<String>,
 }
 
 #[derive(Debug, Copy, Clone)]

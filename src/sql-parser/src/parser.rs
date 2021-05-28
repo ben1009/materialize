@@ -453,7 +453,7 @@ impl<'a> Parser<'a> {
         // includes the opening/closing parentheses, even though this function
         // is not responsible for parsing them.
         fn parse(parser: &mut Parser) -> Result<Either, ParserError> {
-            if let Some(SELECT) | Some(WITH) = parser.peek_keyword() {
+            if parser.peek_keyword(SELECT) || parser.peek_keyword(WITH) {
                 // Easy case one: unambiguously a subquery.
                 Ok(Either::Query(parser.parse_query()?))
             } else if !parser.consume_token(&Token::LParen) {
@@ -1176,11 +1176,25 @@ impl<'a> Parser<'a> {
         self.peek_nth_token(0)
     }
 
-    fn peek_keyword(&self) -> Option<Keyword> {
+    fn peek_keyword(&mut self, kw: Keyword) -> bool {
         match self.peek_token() {
-            Some(Token::Keyword(kw)) => Some(kw),
-            _ => None,
+            Some(Token::Keyword(k)) => k == kw,
+            _ => false,
         }
+    }
+
+    fn peek_keywords(&mut self, keywords: &[Keyword]) -> bool {
+        for (i, keyword) in keywords.iter().enumerate() {
+            match self.peek_nth_token(i) {
+                Some(Token::Keyword(k)) => {
+                    if k != *keyword {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
     }
 
     /// Return the nth token that has not yet been processed.
@@ -1257,26 +1271,23 @@ impl<'a> Parser<'a> {
     /// Look for an expected keyword and consume it if it exists
     #[must_use]
     fn parse_keyword(&mut self, kw: Keyword) -> bool {
-        match self.peek_token() {
-            Some(Token::Keyword(k)) if k == kw => {
-                self.next_token();
-                true
-            }
-            _ => false,
+        if self.peek_keyword(kw) {
+            self.next_token();
+            true
+        } else {
+            false
         }
     }
 
     /// Look for an expected sequence of keywords and consume them if they exist
     #[must_use]
     fn parse_keywords(&mut self, keywords: &[Keyword]) -> bool {
-        let index = self.index;
-        for keyword in keywords {
-            if !self.parse_keyword(*keyword) {
-                self.index = index;
-                return false;
-            }
+        if self.peek_keywords(keywords) {
+            self.index += keywords.len();
+            true
+        } else {
+            false
         }
-        true
     }
 
     /// Look for one of the given keywords and return the one that matches.
@@ -1375,81 +1386,51 @@ impl<'a> Parser<'a> {
 
     /// Parse a SQL CREATE statement
     fn parse_create(&mut self) -> Result<Statement<Raw>, ParserError> {
-        if self.parse_keyword(DATABASE) {
+        if self.peek_keyword(DATABASE) {
             self.parse_create_database()
-        } else if self.parse_keyword(SCHEMA) {
+        } else if self.peek_keyword(SCHEMA) {
             self.parse_create_schema()
-        } else if self.parse_keyword(TABLE) {
-            self.prev_token();
-            self.parse_create_table()
-        } else if self.parse_keyword(OR) || self.parse_keyword(VIEW) {
-            self.prev_token();
-            self.parse_create_view()
-        } else if self.parse_keyword(TEMP) || self.parse_keyword(TEMPORARY) {
-            if self.parse_keyword(VIEW) {
-                self.prev_token();
-                self.prev_token();
-                self.parse_create_view()
-            } else if self.parse_keyword(MATERIALIZED) && self.parse_keyword(VIEW) {
-                self.prev_token();
-                self.prev_token();
-                self.prev_token();
-                self.parse_create_view()
-            } else if self.parse_keyword(TABLE) {
-                self.prev_token();
-                self.prev_token();
-                self.parse_create_table()
-            } else {
-                self.expected(
-                    self.peek_pos(),
-                    "VIEW or MATERIALIZED VIEW after CREATE TEMPORARY",
-                    self.peek_token(),
-                )
-            }
-        } else if self.parse_keyword(MATERIALIZED) {
-            if self.parse_keyword(VIEW) {
-                self.prev_token();
-                self.prev_token();
-                self.parse_create_view()
-            } else if self.parse_keyword(SOURCE) {
-                self.prev_token();
-                self.prev_token();
-                self.parse_create_source()
-            } else {
-                self.expected(
-                    self.peek_pos(),
-                    "VIEW or SOURCE after CREATE MATERIALIZED",
-                    self.peek_token(),
-                )
-            }
-        } else if self.parse_keyword(SOURCE) {
-            self.prev_token();
-            self.parse_create_source()
-        } else if self.parse_keyword(SINK) {
+        } else if self.peek_keyword(SINK) {
             self.parse_create_sink()
-        } else if self.parse_keyword(DEFAULT) {
-            self.expect_keyword(INDEX)?;
-            self.prev_token();
-            self.prev_token();
-            self.parse_create_index()
-        } else if self.parse_keyword(INDEX) {
-            self.prev_token();
-            self.parse_create_index()
-        } else if self.parse_keyword(ROLE) || self.parse_keyword(USER) {
-            self.prev_token();
-            self.parse_create_role()
-        } else if self.parse_keyword(TYPE) {
+        } else if self.peek_keyword(TYPE) {
             self.parse_create_type()
+        } else if self.peek_keyword(ROLE) || self.peek_keyword(USER) {
+            self.parse_create_role()
+        } else if self.peek_keyword(INDEX) || self.peek_keywords(&[DEFAULT, INDEX]) {
+            self.parse_create_index()
+        } else if self.peek_keyword(SOURCE) || self.peek_keywords(&[MATERIALIZED, SOURCE]) {
+            self.parse_create_source()
+        } else if self.peek_keyword(TABLE)
+            || self.peek_keywords(&[TEMP, TABLE])
+            || self.peek_keywords(&[TEMPORARY, TABLE])
+        {
+            self.parse_create_table()
         } else {
-            self.expected(
-                self.peek_pos(),
-                "DATABASE, INDEX, ROLE, SCHEMA, SINK, SOURCE, TYPE, USER, or [MATERIALIZED] VIEW after CREATE",
-                self.peek_token(),
-            )
+            let index = self.index;
+
+            // go over optional modifiers
+            let _ = self.parse_keywords(&[OR, REPLACE]);
+            let _ = self.parse_one_of_keywords(&[TEMP, TEMPORARY]);
+            let _ = self.parse_keyword(MATERIALIZED);
+
+            if self.parse_keyword(VIEW) {
+                self.index = index;
+                self.parse_create_view()
+            } else if self.parse_keyword(VIEWS) {
+                self.index = index;
+                self.parse_create_views()
+            } else {
+                self.expected(
+                    self.peek_pos(),
+                    "DATABASE, SCHEMA, ROLE, USER, TYPE, INDEX, SINK, SOURCE, TABLE or [OR REPLACE] [TEMPORARY] [MATERIALIZED] VIEW or VIEWS after CREATE",
+                    self.peek_token(),
+                )
+            }
         }
     }
 
     fn parse_create_database(&mut self) -> Result<Statement<Raw>, ParserError> {
+        self.expect_keyword(DATABASE)?;
         let if_not_exists = self.parse_if_not_exists()?;
         let name = self.parse_identifier()?;
         Ok(Statement::CreateDatabase(CreateDatabaseStatement {
@@ -1459,6 +1440,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_create_schema(&mut self) -> Result<Statement<Raw>, ParserError> {
+        self.expect_keyword(SCHEMA)?;
         let if_not_exists = self.parse_if_not_exists()?;
         let name = self.parse_object_name()?;
         Ok(Statement::CreateSchema(CreateSchemaStatement {
@@ -1685,6 +1667,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_create_sink(&mut self) -> Result<Statement<Raw>, ParserError> {
+        self.expect_keyword(SINK)?;
         let if_not_exists = self.parse_if_not_exists()?;
         let name = self.parse_object_name()?;
         self.expect_keyword(FROM)?;
@@ -1734,7 +1717,7 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    fn parse_connector(&mut self) -> Result<Connector<Raw>, ParserError> {
+    fn parse_connector(&mut self) -> Result<Connector, ParserError> {
         match self.expect_one_of_keywords(&[FILE, KAFKA, KINESIS, AVRO, S3, POSTGRES, PUBNUB])? {
             PUBNUB => {
                 self.expect_keywords(&[SUBSCRIBE, KEY])?;
@@ -1757,25 +1740,11 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                self.expect_keyword(TABLE)?;
-                let table = self.parse_object_name()?;
-
-                let (columns, constraints) = self.parse_columns(Optional)?;
-
-                if !constraints.is_empty() {
-                    return parser_err!(
-                        self,
-                        self.peek_prev_pos(),
-                        "Cannot specify constraints in Postgres table definition"
-                    );
-                }
 
                 Ok(Connector::Postgres {
                     conn,
                     publication,
                     slot,
-                    table,
-                    columns,
                 })
             }
             FILE => {
@@ -1795,7 +1764,7 @@ impl<'a> Parser<'a> {
                 // one token of lookahead:
                 // * `KEY (` means we're parsing a list of columns for the key
                 // * `KEY FORMAT` means there is no key, we'll parse a KeyValueFormat later
-                let key = if self.peek_keyword() == Some(KEY)
+                let key = if self.peek_keyword(KEY)
                     && self.peek_nth_token(1) != Some(Token::Keyword(FORMAT))
                 {
                     let _ = self.expect_keyword(KEY);
@@ -1878,6 +1847,16 @@ impl<'a> Parser<'a> {
             if_exists = IfExistsBehavior::Skip;
         }
 
+        let definition = self.parse_view_definition()?;
+        Ok(Statement::CreateView(CreateViewStatement {
+            temporary,
+            materialized,
+            if_exists,
+            definition,
+        }))
+    }
+
+    fn parse_view_definition(&mut self) -> Result<ViewDefinition<Raw>, ParserError> {
         // Many dialects support `OR REPLACE` | `OR ALTER` right after `CREATE`, but we don't (yet).
         // ANSI SQL and Postgres support RECURSIVE here, but we don't support it either.
         let name = self.parse_object_name()?;
@@ -1886,14 +1865,62 @@ impl<'a> Parser<'a> {
         self.expect_keyword(AS)?;
         let query = self.parse_query()?;
         // Optional `WITH [ CASCADED | LOCAL ] CHECK OPTION` is widely supported here.
-        Ok(Statement::CreateView(CreateViewStatement {
+        Ok(ViewDefinition {
             name,
             columns,
+            with_options,
             query,
+        })
+    }
+
+    fn parse_create_views(&mut self) -> Result<Statement<Raw>, ParserError> {
+        let mut if_exists = if self.parse_keyword(OR) {
+            self.expect_keyword(REPLACE)?;
+            IfExistsBehavior::Replace
+        } else {
+            IfExistsBehavior::Error
+        };
+        let temporary = self.parse_keyword(TEMPORARY) | self.parse_keyword(TEMP);
+        let materialized = self.parse_keyword(MATERIALIZED);
+        self.expect_keyword(VIEWS)?;
+        if if_exists == IfExistsBehavior::Error && self.parse_if_not_exists()? {
+            if_exists = IfExistsBehavior::Skip;
+        }
+
+        let definitions = if self.parse_keywords(&[FROM, SOURCE]) {
+            let name = self.parse_object_name()?;
+            let targets = if self.consume_token(&Token::LParen) {
+                let targets = self.parse_comma_separated(|parser| {
+                    let name = parser.parse_object_name()?;
+                    let alias = if parser.parse_keyword(AS) {
+                        Some(parser.parse_object_name()?)
+                    } else {
+                        None
+                    };
+                    Ok(CreateViewsSourceTarget { name, alias })
+                })?;
+                self.expect_token(&Token::RParen)?;
+                Some(targets)
+            } else {
+                None
+            };
+            CreateViewsDefinitions::Source { name, targets }
+        } else {
+            let views = self.parse_comma_separated(|parser| {
+                parser.expect_token(&Token::LParen)?;
+                let view = parser.parse_view_definition()?;
+                parser.expect_token(&Token::RParen)?;
+                Ok(view)
+            })?;
+
+            CreateViewsDefinitions::Literal(views)
+        };
+
+        Ok(Statement::CreateViews(CreateViewsStatement {
             temporary,
             materialized,
             if_exists,
-            with_options,
+            definitions,
         }))
     }
 
@@ -1970,6 +1997,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_create_type(&mut self) -> Result<Statement<Raw>, ParserError> {
+        self.expect_keyword(TYPE)?;
         let name = self.parse_object_name()?;
         self.expect_keyword(AS)?;
         let as_type = match self.expect_one_of_keywords(&[LIST, MAP])? {
@@ -2574,6 +2602,13 @@ impl<'a> Parser<'a> {
                         },
                     }
                 }
+                BPCHAR => DataType::Other {
+                    name: RawName::Name(UnresolvedObjectName::unqualified("bpchar")),
+                    typ_mod: match self.parse_optional_precision()? {
+                        Some(u) => vec![u],
+                        None => vec![],
+                    },
+                },
                 VARCHAR => DataType::Other {
                     name: RawName::Name(UnresolvedObjectName::unqualified("varchar")),
                     typ_mod: match self.parse_optional_precision()? {

@@ -50,7 +50,7 @@ mzworkflows:
 
   kafka-5_5_3:
     env:
-      KAFKA_VERSION: 5.5.3
+      KAFKA_VERSION: 5.5.4
     steps:
       - step: workflow
         workflow: test-kafka
@@ -68,7 +68,7 @@ mzworkflows:
         workflow: start-deps
       - step: run
         service: testdrive-svc
-        command: kafka-matrix.td /tests/avro-sinks.td /tests/avro-sources.td /tests/upsert-kafka.td
+        command: kafka-matrix.td /tests/kafka-*.td
       - step: remove-services
         services: [materialized, schema-registry, kafka, zookeeper]
         destroy_volumes: true

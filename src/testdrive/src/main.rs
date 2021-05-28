@@ -7,16 +7,18 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use std::cmp;
 use std::path::PathBuf;
 use std::process;
 use std::time::Duration;
 
 use aws_util::aws;
+use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use rusoto_credential::{AwsCredentials, ChainProvider, ProvideAwsCredentials};
 use structopt::StructOpt;
 use url::Url;
 
-use testdrive::{Config, Error, ResultExt};
+use testdrive::Config;
 
 /// Integration test driver for Materialize.
 #[derive(StructOpt)]
@@ -78,6 +80,18 @@ struct Args {
     #[structopt(long)]
     seed: Option<u32>,
 
+    /// Maximum number of errors before aborting
+    #[structopt(long, default_value = "10")]
+    max_errors: usize,
+
+    /// Max number of tests to run before terminating
+    #[structopt(long, default_value = "18446744073709551615")]
+    max_tests: usize,
+
+    /// Shuffle tests (using the value from --seed, if any)
+    #[structopt(long)]
+    shuffle_tests: bool,
+
     // === Positional arguments. ===
     /// Paths to testdrive scripts to run.
     files: Vec<String>,
@@ -86,16 +100,7 @@ struct Args {
 #[tokio::main]
 async fn main() {
     let args: Args = ore::cli::parse_args();
-    let ci_output = args.ci_output;
-    if let Err(err) = run(args).await {
-        // If printing the error message fails, there's not a whole lot we can
-        // do.
-        let _ = err.print_stderr(ci_output);
-        process::exit(1);
-    }
-}
-
-async fn run(args: Args) -> Result<(), Error> {
+    let mut files = args.files;
     let default_timeout = Duration::from_secs_f64(args.default_timeout);
 
     let (aws_region, aws_account, aws_credentials) = match (
@@ -110,10 +115,10 @@ async fn run(args: Args) -> Result<(), Error> {
             let credentials = provider
                 .credentials()
                 .await
-                .err_ctx("retrieving AWS credentials")?;
+                .expect("retrieving AWS credentials");
             let account = aws::account(provider, region.clone(), default_timeout)
                 .await
-                .err_ctx("getting AWS account details")?;
+                .expect("getting AWS account details");
             (region, account, credentials)
         }
         (_, aws_endpoint) => {
@@ -138,11 +143,13 @@ async fn run(args: Args) -> Result<(), Error> {
     AWS region: {:?}
     Kafka Address: {}
     Schema registry URL: {}
-    materialized host: {:?}",
+    materialized host: {:?}
+    error limit: {}",
         aws_region,
         args.kafka_addr,
         args.schema_registry_url,
         args.materialized_url.get_hosts()[0],
+        args.max_errors
     );
 
     let config = Config {
@@ -162,17 +169,45 @@ async fn run(args: Args) -> Result<(), Error> {
         seed: args.seed,
     };
 
-    if args.files.is_empty() {
-        testdrive::run_stdin(&config).await
-    } else {
-        for file in args.files {
-            if file == "-" {
-                testdrive::run_stdin(&config).await?
-            } else {
-                testdrive::run_file(&config, &file).await?
+    let mut errors = Vec::new();
+    let mut error_files = Vec::new();
+
+    if files.is_empty() {
+        files.push("-".to_string())
+    }
+
+    if args.shuffle_tests {
+        let mut rng: StdRng = SeedableRng::seed_from_u64(
+            args.seed.unwrap_or_else(|| rand::thread_rng().gen()).into(),
+        );
+        files.shuffle(&mut rng);
+    }
+
+    for file in &files[..cmp::min(args.max_tests, files.len())] {
+        if let Err(error) = match file.as_str() {
+            "-" => testdrive::run_stdin(&config).await,
+            _ => testdrive::run_file(&config, &file).await,
+        } {
+            let _ = error.print_stderr(args.ci_output);
+            error_files.push(file.clone());
+
+            errors.push(error);
+            if errors.len() >= args.max_errors {
+                break;
             }
         }
-        Ok(())
+    }
+
+    if errors.is_empty() {
+        println!("testdrive completed successfully.");
+    } else {
+        eprintln!("{} errors were encountered during execution", errors.len());
+
+        if !error_files.is_empty() {
+            eprintln!("files involved: {}", error_files.join(" "));
+        }
+
+        process::exit(1);
     }
 }
 

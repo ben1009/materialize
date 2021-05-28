@@ -70,12 +70,12 @@ $ kafka-create-topic topic=input
 
 > CREATE MATERIALIZED SOURCE input_byo
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-input-${testdrive.seed}'
-    WITH (consistency = 'testdrive-input-consistency-${testdrive.seed}')
+    WITH (consistency_topic = 'testdrive-input-consistency-${testdrive.seed}')
   FORMAT AVRO USING SCHEMA '${schema}' ENVELOPE DEBEZIUM
 
 > CREATE SINK output FROM input_byo
   INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'output-sink-${testdrive.seed}'
-  WITH (exactly_once=true, consistency=true)
+  WITH (exactly_once=true, consistency_topic='output-sink-consistency-${testdrive.seed}')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
 
 $ kafka-ingest format=avro topic=input-consistency timestamp=1 schema=${trxschemakey}
@@ -105,13 +105,17 @@ $ kafka-ingest format=avro topic=input schema=${schema} timestamp=4
 {"before": null, "after": {"row": {"a": 3, "b": 4}}}
 {"before": null, "after": {"row": {"a": 5, "b": 6}}}
 
-$ kafka-verify format=avro sink=materialize.public.output
+$ kafka-verify format=avro sink=materialize.public.output sort-messages=true
 {"before": null, "after": {"row": {"a": 1, "b": 1}}, "transaction": {"id": "1"}}
 {"before": null, "after": {"row": {"a": 1, "b": 2}}, "transaction": {"id": "1"}}
 {"before": null, "after": {"row": {"a": 2, "b": 1}}, "transaction": {"id": "1"}}
 {"before": null, "after": {"row": {"a": 3, "b": 1}}, "transaction": {"id": "1"}}
+
+$ kafka-verify format=avro sink=materialize.public.output sort-messages=true
 {"before": null, "after": {"row": {"a": 11, "b": 11}}, "transaction": {"id": "2"}}
 {"before": null, "after": {"row": {"a": 22, "b": 11}}, "transaction": {"id": "2"}}
+
+$ kafka-verify format=avro sink=materialize.public.output sort-messages=true
 {"before": null, "after": {"row": {"a": 3, "b": 4}}, "transaction": {"id": "3"}}
 {"before": null, "after": {"row": {"a": 5, "b": 6}}, "transaction": {"id": "3"}}
 

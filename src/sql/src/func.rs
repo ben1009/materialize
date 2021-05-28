@@ -100,8 +100,8 @@ impl TypeCategory {
             | ScalarType::Float64
             | ScalarType::Int32
             | ScalarType::Int64
-            | ScalarType::Numeric { .. }
-            | ScalarType::Oid => Self::Numeric,
+            | ScalarType::Oid
+            | ScalarType::APD { .. } => Self::Numeric,
             ScalarType::Interval => Self::Timespan,
             ScalarType::List { .. } => Self::List,
             ScalarType::String => Self::String,
@@ -2213,7 +2213,7 @@ lazy_static! {
                 params!(Interval, Time) => {
                     Operation::binary(|_ecx, lhs, rhs| Ok(rhs.call_binary(lhs, AddTimeInterval)))
                 }, 1849;
-                params!(Numeric{scale: None}, Numeric{scale: None}) => AddNumeric, 17580;
+                params!(APD{scale:None}, APD{scale:None}) => AddAPD, 17581;
             },
             "-" => Scalar {
                 params!(Int32) => UnaryFunc::NegInt32, 558;
@@ -2230,6 +2230,7 @@ lazy_static! {
                     let (lexpr, rexpr) = rescale_decimals_to_same(ecx, lhs, rhs);
                     Ok(lexpr.call_binary(rexpr, SubDecimal))
                 }), 1759;
+                params!(APD{scale: None}, APD{scale: None}) => SubAPD, 17590;
                 params!(Interval, Interval) => SubInterval, 1338;
                 params!(Timestamp, Timestamp) => SubTimestamp, 2067;
                 params!(TimestampTz, TimestampTz) => SubTimestampTz, 1328;
@@ -2262,6 +2263,7 @@ lazy_static! {
                     let expr = lhs.call_binary(rhs, MulDecimal);
                     Ok(rescale_decimal(expr, si, so))
                 }), 1760;
+                params!(APD { scale: None }, APD { scale: None }) => MulAPD, 17600;
             },
             "/" => Scalar {
                 params!(Int32, Int32) => DivInt32, 528;
@@ -2282,7 +2284,7 @@ lazy_static! {
                     let expr = lhs.call_binary(rhs, DivDecimal);
                     Ok(rescale_decimal(expr, si - s2, s))
                 }), 1761;
-                params!(Numeric{scale: None}, Numeric{scale: None}) => DivNumeric, 17610;
+                params!(APD{scale:None}, APD{scale:None}) => DivAPD, 17610;
             },
             "%" => Scalar {
                 params!(Int32, Int32) => ModInt32, 530;
@@ -2439,6 +2441,7 @@ lazy_static! {
                         Ok(lexpr.call_binary(rexpr, BinaryFunc::Lt))
                     })
                 }, 1754;
+                params!(APD{scale:None}, APD{scale:None}) => BinaryFunc::Lt, 17540;
                 params!(Bool, Bool) => BinaryFunc::Lt, 58;
                 params!(Int32, Int32) => BinaryFunc::Lt, 97;
                 params!(Int64, Int64) => BinaryFunc::Lt, 412;
@@ -2454,6 +2457,7 @@ lazy_static! {
                 params!(Bytes, Bytes) => BinaryFunc::Lt, 1957;
                 params!(String, String) => BinaryFunc::Lt, 664;
                 params!(Jsonb, Jsonb) => BinaryFunc::Lt, 3242;
+                params!(ArrayAny, ArrayAny) => BinaryFunc::Lt, 1072;
             },
             "<=" => Scalar {
                 params!(DecimalAny, DecimalAny) => {
@@ -2462,6 +2466,7 @@ lazy_static! {
                         Ok(lexpr.call_binary(rexpr, BinaryFunc::Lte))
                     })
                 }, 1755;
+                params!(APD{scale:None}, APD{scale:None}) => BinaryFunc::Lte, 17550;
                 params!(Bool, Bool) => BinaryFunc::Lte, 1694;
                 params!(Int32, Int32) => BinaryFunc::Lte, 523;
                 params!(Int64, Int64) => BinaryFunc::Lte, 414;
@@ -2477,6 +2482,7 @@ lazy_static! {
                 params!(Bytes, Bytes) => BinaryFunc::Lte, 1958;
                 params!(String, String) => BinaryFunc::Lte, 665;
                 params!(Jsonb, Jsonb) => BinaryFunc::Lte, 3244;
+                params!(ArrayAny, ArrayAny) => BinaryFunc::Lte, 1074;
             },
             ">" => Scalar {
                 params!(DecimalAny, DecimalAny) => {
@@ -2485,6 +2491,7 @@ lazy_static! {
                         Ok(lexpr.call_binary(rexpr, BinaryFunc::Gt))
                     })
                 }, 1756;
+                params!(APD{scale:None}, APD{scale:None}) => BinaryFunc::Gt, 17560;
                 params!(Bool, Bool) => BinaryFunc::Gt, 59;
                 params!(Int32, Int32) => BinaryFunc::Gt, 521;
                 params!(Int64, Int64) => BinaryFunc::Gt, 413;
@@ -2500,6 +2507,7 @@ lazy_static! {
                 params!(Bytes, Bytes) => BinaryFunc::Gt, 1959;
                 params!(String, String) => BinaryFunc::Gt, 666;
                 params!(Jsonb, Jsonb) => BinaryFunc::Gt, 3243;
+                params!(ArrayAny, ArrayAny) => BinaryFunc::Gt, 1073;
             },
             ">=" => Scalar {
                 params!(DecimalAny, DecimalAny) => {
@@ -2508,6 +2516,7 @@ lazy_static! {
                         Ok(lexpr.call_binary(rexpr, BinaryFunc::Gte))
                     })
                 }, 1757;
+                params!(APD{scale:None}, APD{scale:None}) => BinaryFunc::Gte, 17570;
                 params!(Bool, Bool) => BinaryFunc::Gte, 1695;
                 params!(Int32, Int32) => BinaryFunc::Gte, 525;
                 params!(Int64, Int64) => BinaryFunc::Gte, 415;
@@ -2523,6 +2532,7 @@ lazy_static! {
                 params!(Bytes, Bytes) => BinaryFunc::Gte, 1960;
                 params!(String, String) => BinaryFunc::Gte, 667;
                 params!(Jsonb, Jsonb) => BinaryFunc::Gte, 3245;
+                params!(ArrayAny, ArrayAny) => BinaryFunc::Gte, 1075;
             },
             "=" => Scalar {
                 params!(DecimalAny, DecimalAny) => {
@@ -2531,6 +2541,7 @@ lazy_static! {
                         Ok(lexpr.call_binary(rexpr, BinaryFunc::Eq))
                     })
                 }, 1752;
+                params!(APD{scale:None}, APD{scale:None}) => BinaryFunc::Eq, 17520;
                 params!(Bool, Bool) => BinaryFunc::Eq, 91;
                 params!(Int32, Int32) => BinaryFunc::Eq, 96;
                 params!(Int64, Int64) => BinaryFunc::Eq, 410;
@@ -2556,6 +2567,7 @@ lazy_static! {
                         Ok(lexpr.call_binary(rexpr, BinaryFunc::NotEq))
                     })
                 }, 1753;
+                params!(APD{scale:None}, APD{scale:None}) => BinaryFunc::NotEq, 17530;
                 params!(Bool, Bool) => BinaryFunc::NotEq, 85;
                 params!(Int32, Int32) => BinaryFunc::NotEq, 518;
                 params!(Int64, Int64) => BinaryFunc::NotEq, 411;
@@ -2571,6 +2583,7 @@ lazy_static! {
                 params!(Bytes, Bytes) => BinaryFunc::NotEq, 1956;
                 params!(String, String) => BinaryFunc::NotEq, 531;
                 params!(Jsonb, Jsonb) => BinaryFunc::NotEq, 3241;
+                params!(ArrayAny, ArrayAny) => BinaryFunc::NotEq, 1071;
             }
         }
     };

@@ -66,11 +66,11 @@ services:
       - MZ_LOG=pgwire=debug,info
       - MZ_DEV=1
   zookeeper:
-    image: confluentinc/cp-zookeeper:5.5.3
+    image: confluentinc/cp-zookeeper:5.5.4
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
   kafka:
-    image: confluentinc/cp-enterprise-kafka:5.5.3
+    image: confluentinc/cp-enterprise-kafka:5.5.4
     ports:
       - *kafka-internal
       - *kafka-external
@@ -92,7 +92,7 @@ services:
       CONFLUENT_METRICS_REPORTER_TOPIC_CREATE: "false"
       KAFKA_JMX_PORT: 9991
   schema-registry:
-    image: confluentinc/cp-schema-registry:5.5.3
+    image: confluentinc/cp-schema-registry:5.5.4
     ports:
       - *schema-registry
     environment:
@@ -121,13 +121,10 @@ services:
       # ensure that data doesn't get lost across restarts
       # data will be lost if you remove docker volumes (using nuke, for example)
       - prometheus:/prometheus
-      - grafana:/var/lib/grafana
       # specialized configurations
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
-      - ./grafana/conf/load-test.json:/etc/grafana/provisioning/dashboards/chbench-load-test.json
 
 volumes:
-  grafana:
   prometheus:
 
 mzworkflows:
@@ -279,48 +276,6 @@ mzworkflows:
     steps:
     - step: workflow
       workflow: run-benchmark
-
-  benchmark-insert-with-filter:
-    steps:
-    - step: workflow
-      workflow: setup-benchmark-insert-with-filter
-    - step: workflow
-      workflow: run-benchmark-insert-with-filter
-
-  setup-benchmark-insert-with-filter:
-    steps:
-    - step: workflow
-      workflow: start-services
-    - step: run
-      service: kafka-avro-generator
-      command: >-
-        --parallelism=40
-
-  run-benchmark-insert-with-filter:
-    env:
-      MZ_WORKERS: ${MZ_WORKERS:-16}
-    steps:
-    - step: remove-services
-      services: [materialized, perf-dash-scraper]
-      destroy_volumes: true
-    - step: start-services
-      services: [materialized, perf-dash-scraper]
-    - step: run
-      service: metric-verifier
-      daemon: true
-      command: >-
-        scrape
-        --timeout-seconds=900
-        "sum(mz_messages_ingested)"
-        "400000000"
-    - step: run
-      service: create-views
-      command: >-
-        insert_views.sql
-    - step: wait
-      service: metric-verifier
-      expected_return_code: 0
-      print_logs: true
 
   run-generator:
     steps:

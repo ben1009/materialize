@@ -11,17 +11,17 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
+use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context};
+use anyhow::{anyhow, bail, Error};
+use log::warn;
 
 use byteorder::{BigEndian, ByteOrder};
 use mz_avro::error::Error as AvroError;
-use mz_avro::schema::{
-    resolve_schemas, Schema, SchemaFingerprint, SchemaNode, SchemaPiece, SchemaPieceOrNamed,
-};
+use mz_avro::schema::{resolve_schemas, Schema, SchemaNode, SchemaPiece, SchemaPieceOrNamed};
+use ore::retry::Retry;
 use repr::adt::decimal::MAX_DECIMAL_PRECISION;
 use repr::{ColumnName, ColumnType, RelationDesc, ScalarType};
-use sha2::Sha256;
 
 use super::{cdc_v2, is_null, EnvelopeType};
 
@@ -333,9 +333,7 @@ impl ConfluentAvroResolver {
         confluent_wire_format: bool,
     ) -> anyhow::Result<Self> {
         let reader_schema = parse_schema(reader_schema)?;
-        let writer_schemas = config
-            .map(|sr| SchemaCache::new(sr, reader_schema.fingerprint::<Sha256>()))
-            .transpose()?;
+        let writer_schemas = config.map(|sr| SchemaCache::new(sr)).transpose()?;
         Ok(Self {
             reader_schema,
             writer_schemas,
@@ -383,7 +381,7 @@ impl ConfluentAvroResolver {
                 cache
                     .get(schema_id, &self.reader_schema)
                     .await
-                    .with_context(|| format!("Failed to fetch schema with ID {}", schema_id))?
+                    .map_err(Error::msg)?
             }
 
             // If we haven't been asked to use a schema registry, we have no way
@@ -417,22 +415,17 @@ impl fmt::Debug for ConfluentAvroResolver {
     }
 }
 
+#[derive(Debug)]
 struct SchemaCache {
     cache: HashMap<i32, Result<Schema, AvroError>>,
     ccsr_client: ccsr::Client,
-
-    reader_fingerprint: SchemaFingerprint,
 }
 
 impl SchemaCache {
-    fn new(
-        schema_registry: ccsr::ClientConfig,
-        reader_fingerprint: SchemaFingerprint,
-    ) -> Result<SchemaCache, anyhow::Error> {
+    fn new(schema_registry: ccsr::ClientConfig) -> Result<SchemaCache, anyhow::Error> {
         Ok(SchemaCache {
             cache: HashMap::new(),
             ccsr_client: schema_registry.build()?,
-            reader_fingerprint,
         })
     }
 
@@ -448,24 +441,33 @@ impl SchemaCache {
                 // An issue with _fetching_ the schema should be returned
                 // immediately, and not cached, since it might get better on the
                 // next retry.
-                // TODO - some sort of exponential backoff or similar logic
-                let response = self.ccsr_client.get_schema_by_id(id).await?;
+                let ccsr_client = &self.ccsr_client;
+                let response = Retry::default()
+                    .max_duration(Duration::from_secs(30))
+                    .retry(|state| async move {
+                        let res = ccsr_client.get_schema_by_id(id).await;
+                        match res {
+                            Err(e) => {
+                                if let Some(timeout) = state.next_backoff {
+                                    warn!("transient failure fetching schema id {}: {:?}, retrying in {:?}", id, e, timeout);
+                                }
+                                Err(e)
+                            }
+                            _ => res,
+                        }
+                    })
+                    .await?;
                 // Now, we've gotten some json back, so we want to cache it (regardless of whether it's a valid
                 // avro schema, it won't change).
                 //
                 // However, we can't just cache it directly, since resolving schemas takes significant CPU work,
                 // which  we don't want to repeat for every record. So, parse and resolve it, and cache the
                 // result (whether schema or error).
-                let rf = &self.reader_fingerprint.bytes;
                 let result = Schema::from_str(&response.raw).and_then(|schema| {
-                    if &schema.fingerprint::<Sha256>().bytes == rf {
-                        Ok(schema)
-                    } else {
-                        // the writer schema differs from the reader schema,
-                        // so we need to perform schema resolution.
-                        let resolved = resolve_schemas(&schema, reader_schema)?;
-                        Ok(resolved)
-                    }
+                    // Schema fingerprints don't actually capture whether two schemas are meaningfully
+                    // different, because they strip out logical types. Thus, resolve in all cases.
+                    let resolved = resolve_schemas(&schema, reader_schema)?;
+                    Ok(resolved)
                 });
                 v.insert(result)
             }

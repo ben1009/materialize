@@ -10,19 +10,14 @@ memory. Then run the following command:
 
     ./mzcompose run benchmark
 
-There is also a version of this benchmark that uses the same load generator, but a different set
-of views that avoid exercising the upsert operator. This gives a good comparative benchmark to see
-how much slower the upsert operator is:
-
-    ./mzcompose run benchmark-insert-filter
-
 If you're running on a smaller machine, such as a laptop with 8 cores / 32GB of memory, you can
 run the version of this benchmark designed for smaller machines:
 
     ./mzcompose run benchmark-medium
 
-You can also use `mzbench` to run comparative benchmarks on different versions. See the `mzbench`
-documentation for more details but here is an example invocation:
+You can also use [mzbench](../../../doc/developer/mzbench.md) to run comparative benchmarks on
+different versions. See the `mzbench` documentation for more details but here is an example
+invocation (run from the repository root):
 
     ./bin/mzbench -w --size medium avro-upsert
 

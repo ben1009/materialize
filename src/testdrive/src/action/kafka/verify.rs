@@ -85,19 +85,25 @@ impl Action for VerifyAction {
     }
 
     async fn redo(&self, state: &mut State) -> Result<(), String> {
-        let topic_prefix: String = state
-            .pgclient
-            .query_one(
-                "SELECT topic FROM mz_catalog_names JOIN mz_kafka_sinks ON global_id = sink_id WHERE name = $1",
-                &[&self.sink],
-            )
-            .await
-            .map_err(|e| format!("retrieving topic name: {}", e))?
-            .get("topic");
-
-        let topic = match self.consistency {
-            Some(SinkConsistencyFormat::Debezium) => format!("{}-consistency", topic_prefix),
-            None => topic_prefix,
+        async fn get_topic(
+            sink: &str,
+            topic_field: &str,
+            state: &mut State,
+        ) -> Result<String, String> {
+            let query = format!("SELECT {} FROM mz_catalog_names JOIN mz_kafka_sinks ON global_id = sink_id WHERE name = $1", topic_field);
+            let result = state
+                .pgclient
+                .query_one(query.as_str(), &[&sink])
+                .await
+                .map_err(|e| format!("retrieving topic name: {}", e))?
+                .get(topic_field);
+            Ok(result)
+        }
+        let topic: String = match self.consistency {
+            None => get_topic(&self.sink, "topic", state).await?,
+            Some(SinkConsistencyFormat::Debezium) => {
+                get_topic(&self.sink, "consistency_topic", state).await?
+            }
         };
 
         println!("Verifying results in Kafka topic {}", topic);
@@ -120,7 +126,8 @@ impl Action for VerifyAction {
             })
             .transpose()?;
 
-        let config = state.kafka_config.clone();
+        let mut config = state.kafka_config.clone();
+        config.set("enable.auto.offset.store", "false");
 
         let value_schema =
             avro::parse_schema(&value_schema).map_err(|e| format!("parsing avro schema: {}", e))?;
@@ -150,11 +157,15 @@ impl Action for VerifyAction {
         while let Some(Ok(message)) = message_stream.next().await {
             let message = message.map_err(|e| e.to_string())?;
 
-            let bytes = match message.payload() {
-                None => return Err("empty message payload".into()),
-                Some(bytes) => bytes,
+            consumer
+                .store_offset(&message)
+                .map_err(|e| format!("storing message offset: {}", e.to_string()))?;
+
+            let bytes = message.payload();
+            let value_datum = match bytes {
+                None => None,
+                Some(bytes) => Some(avro_from_bytes(value_schema, bytes)?),
             };
-            let value_datum = avro_from_bytes(value_schema, bytes)?;
             let key_datum = key_schema
                 .as_ref()
                 .map(|key_schema| {

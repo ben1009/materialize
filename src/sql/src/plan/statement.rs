@@ -110,6 +110,7 @@ pub fn describe(
         Statement::CreateTable(stmt) => ddl::describe_create_table(&scx, stmt)?,
         Statement::CreateSource(stmt) => ddl::describe_create_source(&scx, stmt)?,
         Statement::CreateView(stmt) => ddl::describe_create_view(&scx, stmt)?,
+        Statement::CreateViews(stmt) => ddl::describe_create_views(&scx, stmt)?,
         Statement::CreateSink(stmt) => ddl::describe_create_sink(&scx, stmt)?,
         Statement::CreateIndex(stmt) => ddl::describe_create_index(&scx, stmt)?,
         Statement::CreateType(stmt) => ddl::describe_create_type(&scx, stmt)?,
@@ -194,6 +195,7 @@ pub fn plan(
         Statement::CreateTable(stmt) => ddl::plan_create_table(scx, stmt),
         Statement::CreateSource(stmt) => ddl::plan_create_source(scx, stmt),
         Statement::CreateView(stmt) => ddl::plan_create_view(scx, stmt, params),
+        Statement::CreateViews(stmt) => ddl::plan_create_views(scx, stmt),
         Statement::CreateSink(stmt) => ddl::plan_create_sink(scx, stmt),
         Statement::CreateIndex(stmt) => ddl::plan_create_index(scx, stmt),
         Statement::CreateType(stmt) => ddl::plan_create_type(scx, stmt),
@@ -237,6 +239,15 @@ pub fn plan(
         Statement::Rollback(stmt) => tcl::plan_rollback(scx, stmt),
         Statement::Commit(stmt) => tcl::plan_commit(scx, stmt),
     }
+}
+
+pub fn plan_copy_from(
+    catalog: &dyn Catalog,
+    id: GlobalId,
+    columns: Vec<usize>,
+    rows: Vec<repr::Row>,
+) -> Result<super::HirRelationExpr, anyhow::Error> {
+    query::plan_copy_from_rows(catalog, id, columns, rows)
 }
 
 /// Whether a SQL object type can be interpreted as matching the type of the given catalog item.

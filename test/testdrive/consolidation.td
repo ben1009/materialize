@@ -78,13 +78,18 @@ $ kafka-create-topic topic=tx
 
 > CREATE MATERIALIZED SOURCE nums
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-nums-${testdrive.seed}'
-  WITH (consistency = 'testdrive-tx-${testdrive.seed}')
+  WITH (consistency_topic = 'testdrive-tx-${testdrive.seed}')
   FORMAT AVRO USING SCHEMA '${nums-schema}'
   ENVELOPE DEBEZIUM
 
 # Disable logical compaction, to ensure we can view historical detail.
 > ALTER INDEX materialize.public.nums_primary_idx
   SET (logical_compaction_window = 'off')
+
+# Create a sink before we ingest any data, to ensure the sink starts AS OF 0
+> CREATE SINK nums_sink FROM nums
+  INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'nums-sink'
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
 
 # ==> Test consolidation.
 
@@ -109,14 +114,21 @@ $ kafka-ingest format=avro topic=tx schema=${tx-schema}
 # Test that by default updates that occurred at the same time are consolidated,
 # but updates that occurred at distinct times are not.
 
-> CREATE SINK nums_sink FROM nums
-  INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'nums-sink'
-  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
+# we know that transactions (timestamps) are emitted in order, but the order
+# of emitted records with the same timestamp is not deterministic. We therefore
+# verify each transaction separately and sort within each transaction to get
+# deterministic results.
 
 $ kafka-verify format=avro sink=materialize.public.nums_sink
 {"before": null, "after": {"row": {"num": 3}}}
-{"before": {"row": {"num": 3}}, "after": {"row": {"num": 4}}}
-{"before": {"row": {"num": 4}}, "after": {"row": {"num": 5}}}
+
+$ kafka-verify format=avro sink=materialize.public.nums_sink sort-messages=true
+{"before": null, "after": {"row": {"num": 4}}}
+{"before": {"row": {"num": 3}}, "after": null}
+
+$ kafka-verify format=avro sink=materialize.public.nums_sink sort-messages=true
+{"before": null, "after": {"row": {"num": 5}}}
+{"before": {"row": {"num": 4}}, "after": null}
 
 # TODO(benesch): re-enable when we support `CREATE SINK ... AS OF`.
 # # Test that a Debezium sink created `AS OF 3` (the latest completed timestamp)

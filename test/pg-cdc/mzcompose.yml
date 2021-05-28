@@ -7,7 +7,7 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-version: '3.7'
+version: "3.7"
 
 mzworkflows:
   pg-cdc:
@@ -19,11 +19,23 @@ mzworkflows:
         dbname: postgres
       - step: run
         service: testdrive-svc
+        command: ${TD_TEST:-*.td}
 
 services:
+  test-certs:
+    mzbuild: test-certs
+    volumes:
+      - secrets:/secrets
   testdrive-svc:
     mzbuild: testdrive
-    entrypoint: testdrive --materialized-url=postgres://materialize@materialized:6875 pg-cdc.td
+    entrypoint:
+      - bash
+      - -c
+      - >-
+        testdrive
+        --materialized-url=postgres://materialize@materialized:6875
+        $$*
+      - bash
     volumes:
       - .:/workdir
     depends_on: [materialized, postgres]
@@ -32,13 +44,26 @@ services:
     mzbuild: materialized
     command: --experimental --disable-telemetry
     ports:
-      - 6875:6875
+      - 6875
+    volumes:
+      - secrets:/share/secrets
     environment:
-    - MZ_DEV=1
-    - MZ_LOG
+      - MZ_DEV=1
+      - MZ_LOG
+    depends_on: [test-certs]
 
   postgres:
-    image: postgres:11.4
+    mzbuild: postgres
     ports:
-      - 5432:5432
-    command: postgres -c wal_level=logical -c max_wal_senders=20 -c max_replication_slots=20
+      - 5432
+    volumes:
+      - ./pg_hba.conf:/share/conf/pg_hba.conf
+    command: >
+      postgres
+        -c wal_level=logical
+        -c max_wal_senders=20
+        -c max_replication_slots=20
+        -c ssl=on
+        -c hba_file=/share/conf/pg_hba.conf
+volumes:
+  secrets:
