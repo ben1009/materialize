@@ -1,4 +1,4 @@
-// Copyright Materialize, Inc. All rights reserved.
+// Copyright Materialize, Inc. and contributors. All rights reserved.
 //
 // Use of this software is governed by the Business Source License
 // included in the LICENSE file.
@@ -126,7 +126,6 @@ pub fn start_server(config: Config) -> Result<Server, Box<dyn Error>> {
             }),
         timestamp_frequency: Duration::from_secs(1),
         cache: None,
-        persistence: None,
         logical_compaction_window: config.logical_compaction_window,
         workers: config.workers,
         timely_worker: timely::WorkerConfig::default(),

@@ -1,4 +1,4 @@
-// Copyright Materialize, Inc. All rights reserved.
+// Copyright Materialize, Inc. and contributors. All rights reserved.
 //
 // Use of this software is governed by the Business Source License
 // included in the LICENSE file.
@@ -19,19 +19,20 @@ use differential_dataflow::{AsCollection, Hashable};
 use timely::dataflow::operators::Map;
 use timely::dataflow::scopes::Child;
 use timely::dataflow::Scope;
+use timely::progress::Antichain;
 
 use dataflow_types::*;
-use expr::{GlobalId, MirRelationExpr};
+use expr::GlobalId;
 use interchange::envelopes::{combine_at_timestamp, dbz_format, upsert_format};
 use ore::cast::CastFrom;
 use repr::adt::decimal::Significand;
 use repr::{Datum, Row, Timestamp};
 
 use crate::render::context::Context;
-use crate::render::RenderState;
+use crate::render::{RelevantTokens, RenderState};
 use crate::sink;
 
-impl<'g, G> Context<Child<'g, G, G::Timestamp>, MirRelationExpr, Row, Timestamp>
+impl<'g, G> Context<Child<'g, G, G::Timestamp>, Row, Timestamp>
 where
     G: Scope<Timestamp = Timestamp>,
 {
@@ -39,28 +40,30 @@ where
     pub(crate) fn export_sink(
         &mut self,
         render_state: &mut RenderState,
+        tokens: &mut RelevantTokens,
         import_ids: HashSet<GlobalId>,
         sink_id: GlobalId,
         sink: &SinkDesc,
+        worker_index: usize,
+        peers: usize,
     ) {
         // put together tokens that belong to the export
         let mut needed_source_tokens = Vec::new();
         let mut needed_additional_tokens = Vec::new();
         let mut needed_sink_tokens = Vec::new();
         for import_id in import_ids {
-            if let Some(addls) = self.additional_tokens.get(&import_id) {
+            if let Some(addls) = tokens.additional_tokens.get(&import_id) {
                 needed_additional_tokens.extend_from_slice(addls);
             }
-            if let Some(source_token) = self.source_tokens.get(&import_id) {
+            if let Some(source_token) = tokens.source_tokens.get(&import_id) {
                 needed_source_tokens.push(source_token.clone());
             }
         }
+
         let (collection, _err_collection) = self
-            .collection(&MirRelationExpr::global_get(
-                sink.from,
-                sink.from_desc.typ().clone(),
-            ))
-            .expect("Sink source collection not loaded");
+            .lookup_id(expr::Id::Global(sink.from))
+            .expect("Sink source collection not loaded")
+            .as_collection();
 
         // Some connectors support keys - extract them.
         let keyed = match sink.connector.clone() {
@@ -204,6 +207,28 @@ where
 
         match sink.connector.clone() {
             SinkConnector::Kafka(c) => {
+                // Extract handles to the relevant source timestamp histories the sink
+                // needs to hear from before it can write data out to Kafka.
+                let mut source_ts_histories = Vec::new();
+
+                for id in &c.transitive_source_dependencies {
+                    if let Some(history) = render_state.ts_histories.get(id) {
+                        let mut history_bindings = history.clone();
+                        // We don't want these to block compaction
+                        // ever.
+                        history_bindings.set_compaction_frontier(Antichain::new().borrow());
+                        source_ts_histories.push(history_bindings);
+                    }
+                }
+
+                // TODO: this is a brittle way to indicate the worker that will write to the sink
+                // because it relies on us continuing to hash on the sink_id, with the same hash
+                // function, and for the Exchange pact to continue to distribute by modulo number
+                // of workers.
+                let active_write_worker =
+                    (usize::cast_from(sink_id.hashed()) % peers) == worker_index;
+                let shared_frontier = Rc::new(RefCell::new(Antichain::from_elem(0)));
+
                 let token = sink::kafka(
                     collection,
                     sink_id,
@@ -211,7 +236,15 @@ where
                     sink.key_desc.clone(),
                     sink.value_desc.clone(),
                     sink.as_of.clone(),
+                    source_ts_histories,
+                    shared_frontier.clone(),
                 );
+
+                if active_write_worker {
+                    render_state
+                        .sink_write_frontiers
+                        .insert(sink_id, shared_frontier);
+                }
                 needed_sink_tokens.push(token);
             }
             SinkConnector::Tail(c) => {

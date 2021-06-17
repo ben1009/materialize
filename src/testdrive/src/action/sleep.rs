@@ -1,4 +1,4 @@
-// Copyright Materialize, Inc. All rights reserved.
+// Copyright Materialize, Inc. and contributors. All rights reserved.
 //
 // Use of this software is governed by the Business Source License
 // included in the LICENSE file.
@@ -22,7 +22,7 @@ pub struct SleepAction {
 
 pub fn build_random_sleep(mut cmd: BuiltinCommand) -> Result<SleepAction, String> {
     let arg = cmd.args.string("duration")?;
-    let duration = parse_duration::parse(&arg).map_err(|e| e.to_string())?;
+    let duration = repr::util::parse_duration(&arg).map_err(|e| e.to_string())?;
     Ok(SleepAction {
         duration,
         random: true,
@@ -31,7 +31,7 @@ pub fn build_random_sleep(mut cmd: BuiltinCommand) -> Result<SleepAction, String
 
 pub fn build_sleep(mut cmd: BuiltinCommand) -> Result<SleepAction, String> {
     let arg = cmd.args.string("duration")?;
-    let duration = parse_duration::parse(&arg).map_err(|e| e.to_string())?;
+    let duration = repr::util::parse_duration(&arg).map_err(|e| e.to_string())?;
     Ok(SleepAction {
         duration,
         random: false,

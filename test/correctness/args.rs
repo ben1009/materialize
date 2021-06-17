@@ -1,4 +1,4 @@
-// Copyright Materialize, Inc. All rights reserved.
+// Copyright Materialize, Inc. and contributors. All rights reserved.
 //
 // Use of this software is governed by the Business Source License
 // included in the LICENSE file.
@@ -41,7 +41,7 @@ pub struct Args {
     #[structopt(long)]
     pub help_config: bool,
     /// Duration for which to run checker.
-    #[structopt(long, parse(try_from_str = parse_duration::parse), default_value = "10m")]
+    #[structopt(long, parse(try_from_str = repr::util::parse_duration), default_value = "10m")]
     pub duration: Duration,
 }
 

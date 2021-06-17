@@ -1,4 +1,4 @@
-// Copyright Materialize, Inc. All rights reserved.
+// Copyright Materialize, Inc. and contributors. All rights reserved.
 //
 // Use of this software is governed by the Business Source License
 // included in the LICENSE file.
@@ -55,7 +55,7 @@ type OptionalDuration = Option<Duration>;
 fn parse_optional_duration(s: &str) -> Result<OptionalDuration, anyhow::Error> {
     match s {
         "off" => Ok(None),
-        _ => Ok(Some(parse_duration::parse(s)?)),
+        _ => Ok(Some(repr::util::parse_duration(s)?)),
     }
 }
 
@@ -89,10 +89,6 @@ struct Args {
     #[structopt(long, hidden = true)]
     safe: bool,
 
-    /// Enable persistent tables. Has to be used with --experimental.
-    #[structopt(long)]
-    persistent_tables: bool,
-
     // === Timely worker configuration. ===
     /// Number of dataflow worker threads.
     #[structopt(short, long, env = "MZ_WORKERS", value_name = "N", default_value)]
@@ -101,7 +97,7 @@ struct Args {
     #[structopt(long, hidden = true)]
     debug_introspection: bool,
     /// Retain prometheus metrics for this amount of time.
-    #[structopt(short, long, hidden = true, parse(try_from_str = parse_duration::parse), default_value = "5min")]
+    #[structopt(short, long, hidden = true, parse(try_from_str =repr::util::parse_duration), default_value = "5min")]
     retain_prometheus_metrics: Duration,
 
     // === Performance tuning parameters. ===
@@ -120,7 +116,7 @@ struct Args {
     #[structopt(long, env = "MZ_LOGICAL_COMPACTION_WINDOW", parse(try_from_str = parse_optional_duration), value_name = "DURATION", default_value = "1ms")]
     logical_compaction_window: OptionalDuration,
     /// Default frequency with which to advance timestamps
-    #[structopt(long, env = "MZ_TIMESTAMP_FREQUENCY", hidden = true, parse(try_from_str = parse_duration::parse), value_name = "DURATION", default_value = "1s")]
+    #[structopt(long, env = "MZ_TIMESTAMP_FREQUENCY", hidden = true, parse(try_from_str =repr::util::parse_duration), value_name = "DURATION", default_value = "1s")]
     timestamp_frequency: Duration,
 
     /// Maximum number of source records to buffer in memory before flushing to
@@ -399,28 +395,6 @@ fn run(args: Args) -> Result<(), anyhow::Error> {
         None
     };
 
-    let persistence = if args.experimental && args.persistent_tables {
-        let traces_path = data_directory.join("table_traces");
-        let wals_path = data_directory.join("table_wals");
-        fs::create_dir_all(&traces_path).with_context(|| {
-            format!(
-                "trying to create traces directory: {}",
-                traces_path.display()
-            )
-        })?;
-        fs::create_dir_all(&wals_path)
-            .with_context(|| format!("trying to create wal directory: {}", wals_path.display()))?;
-
-        Some(coord::PersistenceConfig {
-            traces_path,
-            wals_path,
-        })
-    } else if args.persistent_tables {
-        bail!("cannot specify --persistent-tables without --experimental");
-    } else {
-        None
-    };
-
     // If --disable-telemetry is present, disable telemetry. Otherwise, if a
     // MZ_TELEMETRY_URL environment variable is set, use that as the telemetry
     // URL. Otherwise (the defaults), enable the production server for release mode
@@ -597,7 +571,6 @@ swap: {swap_total}KB total, {swap_used}KB used",
         logical_compaction_window: args.logical_compaction_window,
         timestamp_frequency: args.timestamp_frequency,
         cache,
-        persistence,
         listen_addr: args.listen_addr,
         tls,
         data_directory,

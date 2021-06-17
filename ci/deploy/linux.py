@@ -1,4 +1,4 @@
-# Copyright Materialize, Inc. All rights reserved.
+# Copyright Materialize, Inc. and contributors. All rights reserved.
 #
 # Use of this software is governed by the Business Source License
 # included in the LICENSE file at the root of this repository.
@@ -7,12 +7,14 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
+import boto3
+import io
 import os
+import subprocess
 from pathlib import Path
 
 import semver
 
-from materialize import bintray
 from materialize import cargo
 from materialize import ci_util
 from materialize import deb
@@ -53,10 +55,34 @@ def main() -> None:
 
 def publish_deb(package: str, version: str) -> None:
     print(f"{package} v{version}")
-    bt = bintray.Client(
-        "materialize", user="ci@materialize", api_key=os.environ["BINTRAY_API_KEY"]
+
+    s3 = boto3.client("s3")
+    bucket = "apt.materialize.com"
+    object_key = f"pool/generic/m/ma/materialized-{version}.deb"
+    # Download the staged package (deb-s3 needs to get various metadata from it)
+    s3.download_file(bucket, object_key, f"materialized-{version}.deb")
+    # Import the private key into GPG
+    key = os.environ["GPG_KEY"]
+    gpg = subprocess.Popen(["gpg", "--import"], stdin=subprocess.PIPE)
+    gpg.communicate(key.encode("ascii"))
+
+    # Make the package public
+    s3.put_object_acl(ACL="public-read", Key=object_key, Bucket=bucket)
+    # Run deb-s3 to update the repository (no need to upload the file again)
+    spawn.runv(
+        [
+            "deb-s3",
+            "upload",
+            "-p",
+            "--skip-package-upload",
+            "--sign",
+            "-b",
+            bucket,
+            "-c",
+            "generic",
+            f"./materialized-{version}.deb",
+        ]
     )
-    bt.repo("apt").package(package).publish_uploads(version)
 
 
 def tag_docker(repo: mzbuild.Repository, tag: str) -> None:

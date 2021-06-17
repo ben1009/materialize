@@ -1,5 +1,5 @@
 # Copyright 2020 sqlparser-rs contributors. All rights reserved.
-# Copyright Materialize, Inc. All rights reserved.
+# Copyright Materialize, Inc. and contributors. All rights reserved.
 #
 # This file is derived from the sqlparser-rs project, available at
 # https://github.com/andygrove/sqlparser-rs. It was incorporated
@@ -96,6 +96,11 @@ parse-scalar roundtrip
 id::bigint
 ----
 id::int8
+
+parse-scalar roundtrip
+id::map[text=>int4]
+----
+id::map[text=>int4]
 
 parse-scalar roundtrip
 CAST(id AS BIGINT)
@@ -494,7 +499,7 @@ parse-scalar roundtrip
 parse-scalar
 (1.a)
 ----
-error: Expected right parenthesis, found identifier 'a'
+error: Expected right parenthesis, found identifier "a"
 (1.a)
    ^
 

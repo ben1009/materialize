@@ -1,4 +1,4 @@
-// Copyright Materialize, Inc. All rights reserved.
+// Copyright Materialize, Inc. and contributors. All rights reserved.
 //
 // Use of this software is governed by the Business Source License
 // included in the LICENSE file.
@@ -451,6 +451,11 @@ where
                 self.commit_transaction().await;
             }
         }
+
+        if num_stmts == 0 {
+            self.conn.send(BackendMessage::EmptyQueryResponse).await?;
+        }
+
         self.ready().await
     }
 

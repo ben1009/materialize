@@ -1,4 +1,4 @@
-// Copyright Materialize, Inc. All rights reserved.
+// Copyright Materialize, Inc. and contributors. All rights reserved.
 //
 // Use of this software is governed by the Business Source License
 // included in the LICENSE file.
@@ -36,7 +36,6 @@ mod command;
 mod coord;
 mod error;
 mod id_alloc;
-mod persistence;
 mod sink_connector;
 mod timestamp;
 mod util;
@@ -49,4 +48,3 @@ pub use crate::client::{Client, ConnClient, Handle, SessionClient};
 pub use crate::command::{Cancelled, ExecuteResponse, StartupMessage, StartupResponse};
 pub use crate::coord::{serve, Config, LoggingConfig};
 pub use crate::error::CoordError;
-pub use crate::persistence::PersistenceConfig;
