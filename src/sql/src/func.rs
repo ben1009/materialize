@@ -17,6 +17,7 @@ use std::fmt;
 use std::rc::Rc;
 
 use anyhow::{bail, Context};
+use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use lazy_static::lazy_static;
 
@@ -1152,9 +1153,8 @@ fn coerce_args_to_types(
             .expect("function selection verifies that polymorphic types successfully resolved")
     };
 
-    let do_convert = |arg, ty: &ScalarType| {
-        let arg = typeconv::plan_coerce(ecx, arg, ty)?;
-        typeconv::plan_cast(spec, ecx, CastContext::Implicit, arg, ty)
+    let do_convert = |arg: CoercibleScalarExpr, ty: &ScalarType| {
+        arg.cast_to(&spec.to_string(), ecx, CastContext::Implicit, ty)
     };
 
     let mut exprs = Vec::new();
@@ -1693,7 +1693,15 @@ lazy_static! {
                 params!(String, Timestamp) => BinaryFunc::TimezoneTimestamp, 2069;
                 params!(String, TimestampTz) => BinaryFunc::TimezoneTimestampTz, 1159;
                 // PG defines this as `text timetz`
-                params!(String, Time) => BinaryFunc::TimezoneTime, 2037;
+                params!(String, Time) => Operation::binary(|ecx, lhs, rhs| {
+                    match ecx.qcx.lifetime {
+                        QueryLifetime::OneShot(pcx) => {
+                            let wall_time = DateTime::<Utc>::from(pcx.wall_time).naive_utc();
+                            Ok(lhs.call_binary(rhs, BinaryFunc::TimezoneTime{wall_time}))
+                        },
+                        QueryLifetime::Static => bail!("timezone cannot be used in static queries"),
+                    }
+                }), 2037;
                 params!(Interval, Timestamp) => BinaryFunc::TimezoneIntervalTimestamp, 2070;
                 params!(Interval, TimestampTz) => BinaryFunc::TimezoneIntervalTimestampTz, 1026;
                 // PG defines this as `interval timetz`
@@ -2122,8 +2130,8 @@ lazy_static! {
 
 fn plan_current_timestamp(ecx: &ExprContext, name: &str) -> Result<HirScalarExpr, anyhow::Error> {
     match ecx.qcx.lifetime {
-        QueryLifetime::OneShot => Ok(HirScalarExpr::literal(
-            Datum::from(ecx.qcx.scx.pcx.wall_time),
+        QueryLifetime::OneShot(pcx) => Ok(HirScalarExpr::literal(
+            Datum::from(pcx.wall_time),
             ScalarType::TimestampTz,
         )),
         QueryLifetime::Static => bail!("{} cannot be used in static queries", name),
@@ -2153,7 +2161,7 @@ fn mz_workers(ecx: &ExprContext) -> Result<HirScalarExpr, anyhow::Error> {
 
 fn mz_uptime(ecx: &ExprContext) -> Result<HirScalarExpr, anyhow::Error> {
     match ecx.qcx.lifetime {
-        QueryLifetime::OneShot => Ok(HirScalarExpr::literal(
+        QueryLifetime::OneShot(_) => Ok(HirScalarExpr::literal(
             Datum::from(chrono::Duration::from_std(
                 ecx.catalog().config().start_instant.elapsed(),
             )?),

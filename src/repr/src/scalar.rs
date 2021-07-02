@@ -18,6 +18,8 @@ use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use lowertest::MzEnumReflect;
+
 use crate::adt::apd::Apd;
 use crate::adt::array::Array;
 use crate::adt::decimal::Significand;
@@ -662,7 +664,7 @@ impl fmt::Display for Datum<'_> {
 ///
 /// There is a direct correspondence between `Datum` variants and `ScalarType`
 /// variants.
-#[derive(Clone, Debug, Eq, Serialize, Deserialize, Ord, PartialOrd, EnumKind)]
+#[derive(Clone, Debug, Eq, Serialize, Deserialize, Ord, PartialOrd, EnumKind, MzEnumReflect)]
 #[enum_kind(ScalarBaseType, derive(Hash))]
 pub enum ScalarType {
     /// The type of [`Datum::True`] and [`Datum::False`].
@@ -862,9 +864,13 @@ impl<'a> ScalarType {
     }
 }
 
-// TODO(benesch): the implementations of PartialEq and Hash for ScalarType can
-// be removed when decimal precision is either fixed or removed.
-
+/// NOTE: `ScalarType` equality is complicated by variants that store values.
+/// While we might want to handle stored values in one manner most of the time,
+/// that same approach might be insufficient in some cases.
+///
+/// When assessing unexpected behavior with type planning, it's worthwhile to
+/// see if the default equality is overridden in some other part of the code,
+/// e.g. when deciding how to handle potential casts between types.
 impl PartialEq for ScalarType {
     fn eq(&self, other: &Self) -> bool {
         use ScalarType::*;

@@ -474,6 +474,10 @@
     description: Generate all integer values between `start` and `stop`, inclusive.
   - signature: 'regexp_extract(regex: str, haystack: str) -> Col<string>'
     description: Values of the capture groups of `regex` as matched in `haystack`
+  - signature: 'unnest(a: anyarray)'
+    description: Expands the array `a` into a set of rows.
+  - signature: 'unnest(l: anylist)'
+    description: Expands the list `l` into a set of rows.
 
 - type: Array
   functions:
@@ -513,10 +517,12 @@
     description: Returns the number of workers in use by the server.
   - signature: 'format_type(oid: int, typemod: int) -> text'
     description: Returns the canonical SQL name for the type specified by `oid` with `typemod` applied.
+  - signature: 'current_role() -> text'
+    description: >-
+      Alias for `current_user`.
   - signature: 'current_user() -> text'
     description: >-
       Returns the name of the user who executed the containing query.
-      At the moment this is always `materialize`.
   - signature: 'mz_row_size(expr: Record) -> int'
     description: Returns the number of bytes used to store a row.
 

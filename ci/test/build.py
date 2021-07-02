@@ -22,6 +22,7 @@ from materialize import deb
 from materialize import git
 from materialize import mzbuild
 from materialize import spawn
+from ..deploy.deploy_util import apt_materialized_path, APT_BUCKET
 
 
 def main() -> None:
@@ -32,11 +33,11 @@ def main() -> None:
     # images that we build to Docker Hub, where they will be accessible to
     # other build agents.
     print("--- Acquiring mzbuild images")
+    commit_tag = f'unstable-{git.rev_parse("HEAD")}'
     deps = repo.resolve_dependencies(image for image in repo if image.publish)
     deps.acquire()
-    for d in deps:
-        if not d.pushed():
-            d.push()
+    deps.push()
+    deps.push_tagged(commit_tag)
 
     print("--- Staging Debian package")
     if os.environ["BUILDKITE_BRANCH"] == "main":
@@ -90,11 +91,10 @@ def stage_deb(repo: mzbuild.Repository, package: str, version: str) -> None:
     deb_size = deb_path.stat().st_size
 
     # Stage the package on S3
-    s3 = boto3.client("s3")
-    s3.put_object(
-        Body=open(deb_path, "rb"),
-        Bucket="apt.materialize.com",
-        Key=f"pool/generic/m/ma/materialized-{version}.deb",
+    boto3.client("s3").upload_file(
+        str(deb_path),
+        APT_BUCKET,
+        apt_materialized_path(version),
     )
 
 

@@ -1,8 +1,6 @@
 [workspace]
 members = [
     "demo/billing",
-    "demo/debezium/loadgen",
-    "demo/debezium/validate-topics",
     "fuzz",
     "play/mbta",
     "src/avro",
@@ -15,9 +13,12 @@ members = [
     "src/dataflow-types",
     "src/dataflow",
     "src/expr",
+    "src/expr-test-util",
     "src/http-util",
     "src/interchange",
     "src/kafka-util",
+    "src/lowertest",
+    "src/lowertest-derive",
     "src/materialized",
     "src/metabase",
     "src/mz-process-collector",
@@ -31,6 +32,7 @@ members = [
     "src/prof",
     "src/protoc",
     "src/repr",
+    "src/repr-test-util",
     "src/sql",
     "src/sqllogictest",
     "src/sql-parser",
@@ -47,6 +49,9 @@ members = [
     "test/smith",
     "test/test-util",
 ]
+# Use Cargo's new feature resolver, which can handle target-specific features.
+# See: https://blog.rust-lang.org/2021/03/25/Rust-1.51.0.html#cargos-new-feature-resolver
+resolver = "2"
 
 [profile.dev.package]
 # Compile the backtrace crate and its dependencies with all optimizations, even

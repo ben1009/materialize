@@ -16,6 +16,7 @@
 use std::error::Error;
 use std::fs::File;
 use std::io::Write;
+use std::net::Shutdown;
 use std::net::TcpListener;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -90,8 +91,9 @@ fn test_no_block() -> Result<(), Box<dyn Error>> {
     // Return an error to the coordinator, so that we can shutdown cleanly.
     info!("test_no_block: writing fake schema registry error");
     write!(stream, "HTTP/1.1 503 Service Unavailable\r\n\r\n")?;
-    info!("test_no_block: dropping fake schema registry connection");
-    drop(stream);
+    info!("test_no_block: shutting down fake schema registry connection");
+
+    stream.shutdown(Shutdown::Write).unwrap();
 
     // Verify that the schema registry error was returned to the client, for
     // good measure.
@@ -167,9 +169,9 @@ fn test_tail_basic() -> Result<(), Box<dyn Error>> {
         let data = format!("line {}", i);
         client_writes.execute("INSERT INTO t VALUES ($1)", &[&data])?;
         let row = client_reads.query_one("FETCH ALL c", &[])?;
-        assert_eq!(row.get::<_, i64>("diff"), 1);
+        assert_eq!(row.get::<_, i64>("mz_diff"), 1);
         assert_eq!(row.get::<_, String>("data"), data);
-        events.push((row.get::<_, MzTimestamp>("timestamp").0, data));
+        events.push((row.get::<_, MzTimestamp>("mz_timestamp").0, data));
     }
 
     // Now tail without a snapshot as of each timestamp, verifying that when we do
@@ -206,7 +208,7 @@ fn test_tail_basic() -> Result<(), Box<dyn Error>> {
 
             let actual = client_reads.query_one("FETCH c", &[])?;
             assert_eq!(actual.get::<_, String>("data"), *expected_data);
-            assert_eq!(actual.get::<_, MzTimestamp>("timestamp").0, expected_ts);
+            assert_eq!(actual.get::<_, MzTimestamp>("mz_timestamp").0, expected_ts);
         }
     }
 
@@ -223,7 +225,7 @@ fn test_tail_basic() -> Result<(), Box<dyn Error>> {
     let rows = client_reads.query("FETCH ALL c", &[])?;
     assert_eq!(rows.len(), 3);
     for i in 0..3 {
-        assert_eq!(rows[i].get::<_, i64>("diff"), 1);
+        assert_eq!(rows[i].get::<_, i64>("mz_diff"), 1);
         assert_eq!(rows[i].get::<_, String>("data"), format!("line {}", i + 1));
     }
 
@@ -261,16 +263,16 @@ fn test_tail_progress() -> Result<(), Box<dyn Error>> {
         client_writes.execute("INSERT INTO t1 VALUES ($1)", &[&data])?;
         match client_reads.query("FETCH ALL c1", &[])?.as_slice() {
             [data_row, progress_row] => {
-                assert_eq!(data_row.get::<_, bool>("progressed"), false);
-                assert_eq!(data_row.get::<_, i64>("diff"), 1);
+                assert_eq!(data_row.get::<_, bool>("mz_progressed"), false);
+                assert_eq!(data_row.get::<_, i64>("mz_diff"), 1);
                 assert_eq!(data_row.get::<_, String>("data"), data);
 
-                assert_eq!(progress_row.get::<_, bool>("progressed"), true);
-                assert_eq!(progress_row.get::<_, Option<i64>>("diff"), None);
+                assert_eq!(progress_row.get::<_, bool>("mz_progressed"), true);
+                assert_eq!(progress_row.get::<_, Option<i64>>("mz_diff"), None);
                 assert_eq!(progress_row.get::<_, Option<String>>("data"), None);
 
-                let data_ts: MzTimestamp = data_row.get("timestamp");
-                let progress_ts: MzTimestamp = progress_row.get("timestamp");
+                let data_ts: MzTimestamp = data_row.get("mz_timestamp");
+                let progress_ts: MzTimestamp = progress_row.get("mz_timestamp");
                 assert!(data_ts < progress_ts);
             }
             _ => panic!("wrong number of rows returned"),
@@ -287,12 +289,12 @@ fn test_tail_progress() -> Result<(), Box<dyn Error>> {
             DECLARE c2 CURSOR FOR TAIL t2 WITH (PROGRESS);",
         )?;
         let data_row = client_reads.query_one("FETCH 1 c2", &[])?;
-        assert_eq!(data_row.get::<_, bool>("progressed"), false);
-        assert_eq!(data_row.get::<_, i64>("diff"), 1);
+        assert_eq!(data_row.get::<_, bool>("mz_progressed"), false);
+        assert_eq!(data_row.get::<_, i64>("mz_diff"), 1);
         assert_eq!(data_row.get::<_, String>("data"), "data");
         let progress_row = client_reads.query_one("FETCH 1 c2", &[])?;
-        assert_eq!(progress_row.get::<_, bool>("progressed"), true);
-        assert_eq!(progress_row.get::<_, Option<i64>>("diff"), None);
+        assert_eq!(progress_row.get::<_, bool>("mz_progressed"), true);
+        assert_eq!(progress_row.get::<_, Option<i64>>("mz_diff"), None);
         assert_eq!(progress_row.get::<_, Option<String>>("data"), None);
     }
 
@@ -495,12 +497,12 @@ fn test_tail_unmaterialized_file() -> Result<(), Box<dyn Error>> {
 
     append(b"line 1\n")?;
     let row = client.query_one("FETCH ALL c", &[])?;
-    assert_eq!(row.get::<_, i64>("diff"), 1);
+    assert_eq!(row.get::<_, i64>("mz_diff"), 1);
     assert_eq!(row.get::<_, String>("text"), "line 1");
 
     append(b"line 2\n")?;
     let row = client.query_one("FETCH ALL c", &[])?;
-    assert_eq!(row.get::<_, i64>("diff"), 1);
+    assert_eq!(row.get::<_, i64>("mz_diff"), 1);
     assert_eq!(row.get::<_, String>("text"), "line 2");
 
     // Wait a little bit to make sure no more new rows arrive.

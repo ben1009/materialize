@@ -12,26 +12,26 @@
 
 // NB: These really don't need to be public, but the public doc lint is nice.
 pub mod cache;
+pub mod encoding;
 pub mod future;
 pub mod handle;
+pub mod runtime;
 pub mod trace;
 
 use std::collections::HashMap;
-use std::time::SystemTime;
 
 use abomonation::abomonated::Abomonated;
-use abomonation_derive::Abomonation;
 use differential_dataflow::trace::Description;
 use timely::progress::Antichain;
 use timely::PartialOrder;
 
 use crate::error::Error;
 use crate::indexed::cache::BlobCache;
+use crate::indexed::encoding::{BlobFutureBatch, BlobMeta, BlobTraceBatch, BufferEntry, Id};
 use crate::indexed::future::{BlobFuture, FutureSnapshot};
 use crate::indexed::trace::{BlobTrace, TraceSnapshot};
 use crate::persister::Snapshot;
 use crate::storage::{Blob, Buffer, SeqNo};
-use crate::Id;
 
 /// A persistent, compacting, indexed data structure of `(Key, Value, Time,
 /// Diff)` updates.
@@ -68,9 +68,14 @@ use crate::Id;
 /// for indexed use, instead of the current situation, which is more complicated
 /// to reason about.
 pub struct Indexed<U: Buffer, L: Blob> {
-    blob: BlobCache<L>,
     last_file_id: u128,
+    next_stream_id: Id,
+    // This is conceptually a map from `String` -> `Id`, but lookups are rare
+    // and this representation is optimized for the metadata serialization path,
+    // which is less rare.
+    id_mapping: Vec<(String, Id)>,
     buf: U,
+    blob: BlobCache<L>,
     futures: HashMap<Id, BlobFuture>,
     traces: HashMap<Id, BlobTrace>,
 }
@@ -80,35 +85,46 @@ impl<U: Buffer, L: Blob> Indexed<U, L> {
     /// existing data for them in the blob storage, if any.
     pub fn new(buf: U, blob: L) -> Result<Self, Error> {
         let blob = BlobCache::new(blob);
-        let meta = blob.get_meta()?.unwrap_or_else(|| BlobMeta {
-            last_file_id: Self::now_millis(),
-            futures: Vec::new(),
-            traces: Vec::new(),
-        });
+        let meta = blob.get_meta()?.unwrap_or_default();
         let futures = meta
             .futures
             .into_iter()
-            .map(|(id, meta)| (Id(id), BlobFuture::new(meta)))
+            .map(|(id, meta)| (id, BlobFuture::new(meta)))
             .collect();
         let traces = meta
             .traces
             .into_iter()
-            .map(|(id, meta)| (Id(id), BlobTrace::new(meta)))
+            .map(|(id, meta)| (id, BlobTrace::new(meta)))
             .collect();
         let indexed = Indexed {
-            blob,
             last_file_id: meta.last_file_id,
+            next_stream_id: meta.next_stream_id,
+            id_mapping: meta.id_mapping,
             buf,
+            blob,
             futures,
             traces,
         };
         Ok(indexed)
     }
 
+    /// Releases exclusive-writer locks and causes all future commands to error.
+    ///
+    /// This method is idempotent.
+    pub fn close(&mut self) -> Result<(), Error> {
+        // Be careful to attempt to close both buf and blob even if one of the
+        // closes fails.
+        let buf_res = self.buf.close();
+        let blob_res = self.blob.close();
+        buf_res?;
+        blob_res?;
+        Ok(())
+    }
+
     fn new_blob_key(&mut self) -> String {
         // TODO: Use meaningful file names? Something like id+desc might be
         // useful when debugging.
-        let mut file_id = Self::now_millis();
+        let mut file_id = BlobMeta::now_millis();
         if file_id <= self.last_file_id {
             file_id = self.last_file_id + 1;
         }
@@ -116,20 +132,24 @@ impl<U: Buffer, L: Blob> Indexed<U, L> {
         file_id.to_string()
     }
 
-    fn now_millis() -> u128 {
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    }
-
-    /// Creates, if necessary, a new future and trace with the given id.
+    /// Creates, if necessary, a new future and trace with the given external
+    /// stream name, returning the corresponding internal stream id.
     ///
-    /// This method is idempotent: ids may be registered multiple times. TODO:
-    /// Is this idempotence necessary/useful?
-    pub fn register(&mut self, id: Id) {
+    /// This method is idempotent: ids may be registered multiple times.
+    pub fn register(&mut self, id_str: &str) -> Id {
+        let id = self.id_mapping.iter().find(|(s, _)| s == &id_str);
+        let id = match id {
+            Some((_, id)) => *id,
+            None => {
+                let id = self.next_stream_id;
+                self.id_mapping.push((id_str.to_owned(), id));
+                self.next_stream_id = Id(id.0 + 1);
+                id
+            }
+        };
         self.futures.entry(id).or_default();
         self.traces.entry(id).or_default();
+        id
     }
 
     /// Drains writes from the buffer into the future and does any necessary
@@ -162,7 +182,7 @@ impl<U: Buffer, L: Blob> Indexed<U, L> {
         }
 
         let entry = BufferEntry {
-            id: id.0,
+            id: id,
             updates: updates.to_vec(),
         };
         let mut entry_bytes = Vec::new();
@@ -174,7 +194,7 @@ impl<U: Buffer, L: Blob> Indexed<U, L> {
 
     /// Atomically moves all writes currently in the buffer into the future.
     fn drain_buf(&mut self) -> Result<(), Error> {
-        let mut updates_by_id: HashMap<u64, Vec<(SeqNo, (String, String), u64, isize)>> =
+        let mut updates_by_id: HashMap<Id, Vec<(SeqNo, (String, String), u64, isize)>> =
             HashMap::new();
         let desc = self.buf.snapshot(|seqno, buf| {
             let mut buf = buf.to_vec();
@@ -267,7 +287,7 @@ impl<U: Buffer, L: Blob> Indexed<U, L> {
 
         // ...writing that snapshot's data into trace...
         let batch = BlobTraceBatch {
-            id: id.0,
+            id: id,
             desc: desc.clone(),
             updates,
         };
@@ -288,7 +308,7 @@ impl<U: Buffer, L: Blob> Indexed<U, L> {
     fn append_future(&mut self, key: String, batch: BlobFutureBatch) -> Result<(), Error> {
         let future = self
             .futures
-            .get_mut(&Id(batch.id))
+            .get_mut(&batch.id)
             .ok_or_else(|| Error::from(format!("never registered: {:?}", batch.id)))?;
         future.append(key, batch, &mut self.blob)?;
         // TODO: Instead of fully overwriting META each time, this should be
@@ -301,7 +321,7 @@ impl<U: Buffer, L: Blob> Indexed<U, L> {
     fn append_trace(&mut self, key: String, batch: BlobTraceBatch) -> Result<(), Error> {
         let trace = self
             .traces
-            .get_mut(&Id(batch.id))
+            .get_mut(&batch.id)
             .ok_or_else(|| Error::from(format!("never registered: {:?}", batch.id)))?;
         trace.append(key, batch, &mut self.blob)?;
         // TODO: Instead of fully overwriting META each time, this should be
@@ -312,15 +332,17 @@ impl<U: Buffer, L: Blob> Indexed<U, L> {
     fn serialize_meta(&self) -> BlobMeta {
         BlobMeta {
             last_file_id: self.last_file_id,
+            next_stream_id: self.next_stream_id,
+            id_mapping: self.id_mapping.clone(),
             futures: self
                 .futures
                 .iter()
-                .map(|(id, future)| (id.0, future.meta()))
+                .map(|(id, future)| (*id, future.meta()))
                 .collect(),
             traces: self
                 .traces
                 .iter()
-                .map(|(id, trace)| (id.0, trace.meta()))
+                .map(|(id, trace)| (*id, trace.meta()))
                 .collect(),
         }
     }
@@ -347,7 +369,7 @@ impl<U: Buffer, L: Blob> Indexed<U, L> {
                 let entry: Abomonated<BufferEntry, Vec<u8>> =
                     unsafe { Abomonated::new(buf.to_owned()) }
                         .ok_or_else(|| Error::from(format!("invalid buffer entry")))?;
-                if entry.id != id.0 || !buf_lower.less_equal(&seqno) {
+                if entry.id != id || !buf_lower.less_equal(&seqno) {
                     return Ok(());
                 }
                 buffer.0.extend(entry.updates.iter().cloned());
@@ -360,6 +382,7 @@ impl<U: Buffer, L: Blob> Indexed<U, L> {
 }
 
 /// A consistent snapshot of the data currently in a [Buffer].
+#[derive(Debug)]
 struct BufferSnapshot(Vec<((String, String), u64, isize)>);
 
 impl Snapshot for BufferSnapshot {
@@ -370,84 +393,13 @@ impl Snapshot for BufferSnapshot {
 }
 
 /// A consistent snapshot of all data currently stored for an id.
+#[derive(Debug)]
 pub struct IndexedSnapshot(BufferSnapshot, FutureSnapshot, TraceSnapshot);
 
 impl Snapshot for IndexedSnapshot {
     fn read<E: Extend<((String, String), u64, isize)>>(&mut self, buf: &mut E) -> bool {
         self.0.read(buf) || self.1.read(buf) || self.2.read(buf)
     }
-}
-
-/// The structure serialized and stored as an entry in a Buffer.
-#[derive(Debug, Abomonation)]
-pub struct BufferEntry {
-    /// Id of the stream this batch belongs to.
-    id: u64,
-    /// The updates themselves.
-    updates: Vec<((String, String), u64, isize)>,
-}
-
-/// The structure serialized and stored as a value in [Blob] storage for
-/// metadata keys.
-#[derive(Clone, Debug, Abomonation)]
-pub struct BlobMeta {
-    /// The most recently assigned key name.
-    last_file_id: u128,
-    /// BlobFutures indexed by stream id.
-    futures: Vec<(u64, BlobFutureMeta)>,
-    /// BlobTraces indexed by stream id.
-    traces: Vec<(u64, BlobTraceMeta)>,
-}
-
-/// The metadata necessary to reconstruct a BlobFuture.
-#[derive(Clone, Debug, Abomonation)]
-pub struct BlobFutureMeta {
-    /// A lower bound of data contained by this BlobFuture. Data before this may
-    /// be present in the batches, but has been logically moved into the trace
-    /// and should be ignored.
-    ts_lower: Antichain<u64>,
-    /// The batches that make up the BlobFuture, represented by their
-    /// description and the key to retrieve the batch's data from the blob
-    /// store. Note that Descriptions are half-open intervals `[lower, upper)`.
-    batches: Vec<(Description<SeqNo>, String)>,
-}
-
-/// The metadata necessary to reconstruct a BlobTrace.
-#[derive(Clone, Debug, Abomonation)]
-pub struct BlobTraceMeta {
-    /// The batches that make up the BlobTrace, represented by their description
-    /// and the key to retrieve the batch's data from the blob store. Note that
-    /// Descriptions are half-open intervals `[lower, upper)`.
-    batches: Vec<(Description<u64>, String)>,
-}
-
-/// The structure serialized and stored as a value in [Blob] storage for
-/// data keys corresponding to future data.
-#[derive(Clone, Debug, Abomonation)]
-pub struct BlobFutureBatch {
-    /// Id of the stream this batch belongs to.
-    id: u64,
-    /// Which updates are included in this batch.
-    desc: Description<SeqNo>,
-    /// The updates themselves.
-    updates: Vec<(SeqNo, (String, String), u64, isize)>,
-}
-
-/// The structure serialized and stored as a value in [Blob] storage for data
-/// keys corresponding to trace data.
-///
-/// TODO: This probably wants to be a different level of abstraction, so we can
-/// put multiple small batches in a single blob but also break a very large
-/// batch over multiple blobs. We also may want to break the latter into chunks
-/// for checksum and encryption?
-#[derive(Clone, Debug, Abomonation)]
-pub struct BlobTraceBatch {
-    /// Id of the trace this batch belongs to.
-    id: u64,
-    /// Which updates are included in this batch.
-    desc: Description<u64>,
-    /// The updates themselves.
-    updates: Vec<((String, String), u64, isize)>,
 }
 
 #[cfg(test)]
@@ -474,9 +426,11 @@ mod tests {
             (("2".into(), "".into()), 2, 1),
         ];
 
-        let mut i = Indexed::new(MemBuffer::new(), MemBlob::new())?;
-        let id = Id(0);
-        i.register(id);
+        let mut i = Indexed::new(
+            MemBuffer::new("single_stream")?,
+            MemBlob::new("single_stream")?,
+        )?;
+        let id = i.register("0");
 
         // Empty things are empty.
         let IndexedSnapshot(buf, future, trace) = i.snapshot(id)?;

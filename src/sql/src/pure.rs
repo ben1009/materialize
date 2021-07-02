@@ -70,7 +70,9 @@ pub fn purify(
         Err(anyhow!("SQL statement does not refer to a source"))
     };
 
-    async {
+    let now = catalog.now();
+
+    async move {
         if let Statement::CreateSource(CreateSourceStatement {
             col_names,
             connector,
@@ -100,6 +102,7 @@ pub fn purify(
                         consumer.clone(),
                         &topic,
                         &with_options_map,
+                        now,
                     )
                     .await?
                     {

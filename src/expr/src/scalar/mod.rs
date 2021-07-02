@@ -13,6 +13,7 @@ use std::mem;
 
 use serde::{Deserialize, Serialize};
 
+use lowertest::MzEnumReflect;
 use ore::collections::CollectionExt;
 use ore::str::separated;
 use repr::adt::array::InvalidArrayError;
@@ -27,7 +28,9 @@ use crate::scalar::func::parse_timezone;
 pub mod func;
 pub mod like_pattern;
 
-#[derive(Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
+#[derive(
+    Ord, PartialOrd, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash, MzEnumReflect,
+)]
 pub enum MirScalarExpr {
     /// A column of the input row
     Column(usize),
@@ -482,15 +485,20 @@ impl MirScalarExpr {
                             MirScalarExpr::literal(Err(err), e.typ(&relation_type).scalar_type)
                         }
                     }
-                } else if *func == BinaryFunc::TimezoneTime && expr1.is_literal() {
-                    let tz = expr1.as_literal_str().unwrap();
-                    *e = match parse_timezone(tz) {
-                        Ok(tz) => MirScalarExpr::CallUnary {
-                            func: UnaryFunc::TimezoneTime(tz),
-                            expr: Box::new(expr2.take()),
-                        },
-                        Err(err) => {
-                            MirScalarExpr::literal(Err(err), e.typ(&relation_type).scalar_type)
+                } else if let BinaryFunc::TimezoneTime { wall_time } = func {
+                    if expr1.is_literal() {
+                        let tz = expr1.as_literal_str().unwrap();
+                        *e = match parse_timezone(tz) {
+                            Ok(tz) => MirScalarExpr::CallUnary {
+                                func: UnaryFunc::TimezoneTime {
+                                    tz,
+                                    wall_time: *wall_time,
+                                },
+                                expr: Box::new(expr2.take()),
+                            },
+                            Err(err) => {
+                                MirScalarExpr::literal(Err(err), e.typ(&relation_type).scalar_type)
+                            }
                         }
                     }
                 } else if *func == BinaryFunc::And {

@@ -10,6 +10,11 @@
 //! Persistence for Materialize dataflows.
 
 #![warn(missing_docs)]
+#![warn(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 
 pub mod error;
 pub mod file;
@@ -19,34 +24,11 @@ pub mod operators;
 pub mod persister;
 pub mod storage;
 
-use std::sync::{Arc, Mutex};
-
-use crate::error::Error;
-use crate::persister::Persister;
-
 // TODO
-// - The concurrency story. I imagine this working something like the following:
-//   - Writes from all streams are funnelled to a single thread which
-//     essentially runs in a loop, writing and fsync-ing a batch of updates (via
-//     an impl of Buffer). When it finishes persisting a batch, it grabs
-//     whatever has buffered since it started and uses that as the next batch.
-//     If there's ever no work to do, it sleeps until the next write arrives in
-//     the buffer.
-//   - Another thread loops and periodically moves data from the Buffer into the
-//     Indexed structure. Periodically, this thread will get notifications that
-//     a timestamp has been "sealed" on some stream, which unblocks moving data
-//     from the "Future" part of Indexed into the "Trace" part. Similarly, it
-//     will periodically get a notification that the Trace can be compacted.
-//   - We also need to be able to read from Indexed, TBD how the concurrency
-//     part of this should work.
-//   - Also TBD is who controls the two threads described above. Presumably one
-//     of regular rust threads, tokio, or timely.
 // - Should we hard-code the Key, Val, Time, Diff types everywhere or introduce
 //   them as type parameters? Materialize will only be using one combination of
 //   them (two with `()` vals?) but the generality might make things easier to
 //   read. Of course, it also might make things harder to read.
-// - Is PersistManager getting us anything over a type alias? At the moment, the
-//   only thing it does is wrap mutex poison errors in this crate's error type.
 // - This method of getting the metadata handle ends up being pretty clunky in
 //   practice. Maybe instead the user should pass in a mutable reference to a
 //   `Meta` they've constructed like `probe_with`?
@@ -73,45 +55,6 @@ use crate::persister::Persister;
 // Testing edge cases:
 // - Failure while draining from buffer into future.
 // - Equality edge cases around all the various timestamp/frontier checks.
-
-/// A unique id for a persisted stream.
-#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
-pub struct Id(pub u64);
-
-/// A thread-safe, clone-able wrapper for [Persister].
-pub struct PersistManager<P> {
-    persister: Arc<Mutex<P>>,
-}
-
-// The derived Send, Sync, and Clone don't work because of the type parameter.
-unsafe impl<P> Send for PersistManager<P> {}
-unsafe impl<P> Sync for PersistManager<P> {}
-impl<P> Clone for PersistManager<P> {
-    fn clone(&self) -> Self {
-        PersistManager {
-            persister: self.persister.clone(),
-        }
-    }
-}
-
-impl<P: Persister> PersistManager<P> {
-    /// Returns a [PersistManager] wrapper for the given [Persister].
-    pub fn new(persister: P) -> Self {
-        PersistManager {
-            persister: Arc::new(Mutex::new(persister)),
-        }
-    }
-
-    /// A wrapper for [Persister::create_or_load].
-    pub fn create_or_load(&mut self, id: Id) -> Result<Token<P::Write, P::Meta>, Error> {
-        self.persister.lock()?.create_or_load(id)
-    }
-
-    /// A wrapper for [Persister::destroy].
-    pub fn destroy(&mut self, id: Id) -> Result<(), Error> {
-        self.persister.lock()?.destroy(id)
-    }
-}
 
 /// An exclusivity token needed to construct persistence [operators].
 ///

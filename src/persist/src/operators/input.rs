@@ -16,15 +16,16 @@ use timely::dataflow::operators::{ActivateCapability, Concat, ToStream, Unordere
 use timely::dataflow::{Scope, Stream};
 use timely::scheduling::ActivateOnDrop;
 
-use crate::persister::{Meta, Snapshot, Write};
+use crate::indexed::handle::{StreamMetaHandle, StreamWriteHandle};
+use crate::persister::Snapshot;
 use crate::Token;
 
 /// A persistent equivalent of [UnorderedInput].
 pub trait PersistentUnorderedInput<G: Scope<Timestamp = u64>> {
     /// A persistent equivalent of [UnorderedInput::new_unordered_input].
-    fn new_persistent_unordered_input<W: Write + 'static, M: Meta>(
+    fn new_persistent_unordered_input(
         &mut self,
-        token: Token<W, M>,
+        token: Token<StreamWriteHandle, StreamMetaHandle>,
     ) -> (
         (PersistentUnorderedHandle, ActivateCapability<G::Timestamp>),
         Stream<G, (String, u64, isize)>,
@@ -35,9 +36,9 @@ impl<G> PersistentUnorderedInput<G> for G
 where
     G: Scope<Timestamp = u64>,
 {
-    fn new_persistent_unordered_input<W: Write + 'static, M: Meta>(
+    fn new_persistent_unordered_input(
         &mut self,
-        token: Token<W, M>,
+        token: Token<StreamWriteHandle, StreamMetaHandle>,
     ) -> (
         (PersistentUnorderedHandle, ActivateCapability<G::Timestamp>),
         Stream<G, (String, u64, isize)>,
@@ -67,7 +68,7 @@ where
 
 /// A persistent equivalent of [UnorderedHandle].
 pub struct PersistentUnorderedHandle {
-    write: Box<dyn Write>,
+    write: Box<StreamWriteHandle>,
     handle: UnorderedHandle<u64, (String, u64, isize)>,
 }
 
@@ -86,7 +87,7 @@ impl PersistentUnorderedHandle {
 
 /// A persistent equivalent of [UnorderedHandle::session]'s return type.
 pub struct PersistentUnorderedSession<'b> {
-    write: &'b mut Box<dyn Write>,
+    write: &'b mut Box<StreamWriteHandle>,
     session: ActivateOnDrop<
         AutoflushSession<
             'b,
@@ -113,19 +114,18 @@ mod tests {
     use timely::dataflow::operators::Capture;
 
     use crate::error::Error;
-    use crate::mem::MemPersister;
-    use crate::persister::Persister;
-    use crate::Id;
+    use crate::mem::MemRegistry;
 
     use super::*;
 
     #[test]
     fn new_persistent_unordered_input() -> Result<(), Error> {
-        let mut p = MemPersister::new();
+        let mut registry = MemRegistry::new();
+        let mut p = registry.open("1", "new_persistent_unordered_input_1")?;
 
-        let dataz = timely::execute_directly(move |worker| {
+        timely::execute_directly(move |worker| {
             let (mut handle, cap) = worker.dataflow(|scope| {
-                let persister = p.create_or_load(Id(1)).unwrap();
+                let persister = p.create_or_load("1").unwrap();
                 let (input, _stream) = scope.new_persistent_unordered_input(persister);
                 input
             });
@@ -133,16 +133,15 @@ mod tests {
             for i in 1..=5 {
                 session.give((i.to_string(), i, 1));
             }
-            p.into_inner()
         });
 
         // Execute a second dataflow and reuse the previous in-memory state.
         // This exists to simulate what would happen after a restart in a Persister
         // that was actually backed by persistent storage
-        let mut p = MemPersister::from_inner(dataz);
+        let mut p = registry.open("1", "new_persistent_unordered_input_2")?;
         let recv = timely::execute_directly(move |worker| {
             let ((mut handle, cap), recv) = worker.dataflow(|scope| {
-                let persister = p.create_or_load(Id(1)).unwrap();
+                let persister = p.create_or_load("1").unwrap();
                 let (input, stream) = scope.new_persistent_unordered_input(persister);
                 // Send the data to be captured by a channel so that we can replay
                 // its contents outside of the dataflow and verify they are correct

@@ -20,7 +20,8 @@ use timely::progress::{Antichain, Timestamp};
 
 use crate::error::Error;
 use crate::indexed::cache::BlobCache;
-use crate::indexed::{BlobTraceBatch, BlobTraceMeta};
+use crate::indexed::encoding::BlobTraceMeta;
+use crate::indexed::BlobTraceBatch;
 use crate::persister::Snapshot;
 use crate::storage::Blob;
 
@@ -120,6 +121,7 @@ impl BlobTrace {
 }
 
 /// A consistent snapshot of the data currently in a persistent [BlobTrace].
+#[derive(Debug)]
 pub struct TraceSnapshot {
     /// An open upper bound on the times of contained updates.
     pub ts_upper: Antichain<u64>,

@@ -41,7 +41,7 @@ use ore::collections::CollectionExt;
 use ore::iter::IteratorExt;
 use ore::str::StrExt;
 use repr::{strconv, ColumnName, ColumnType, Datum, RelationDesc, RelationType, Row, ScalarType};
-use sql_parser::ast::CreateSourceFormat;
+use sql_parser::ast::{CreateSourceFormat, KeyConstraint};
 
 use crate::ast::display::AstDisplay;
 use crate::ast::{
@@ -389,13 +389,24 @@ pub fn plan_create_source(
         if_not_exists,
         materialized,
         format,
+        key_constraint,
     } = &stmt;
 
     let with_options_original = with_options;
     let mut with_options = normalize::options(with_options);
 
     let mut consistency = Consistency::RealTime;
-    let mut ts_frequency = scx.catalog.config().timestamp_frequency;
+
+    let ts_frequency = match with_options.remove("timestamp_frequency_ms") {
+        Some(val) => match val {
+            Value::Number(n) => match n.parse::<u64>() {
+                Ok(n) => Duration::from_millis(n),
+                Err(_) => bail!("timestamp_frequency_ms must be an u64"),
+            },
+            _ => bail!("timestamp_frequency_ms must be an u64"),
+        },
+        None => scx.catalog.config().timestamp_frequency,
+    };
 
     let (external_connector, encoding) = match connector {
         Connector::Kafka { broker, topic, .. } => {
@@ -415,11 +426,6 @@ pub fn plan_create_source(
                 Some(Value::String(s)) => Some(s),
                 Some(_) => bail!("group_id_prefix must be a string"),
             };
-
-            ts_frequency = extract_timestamp_frequency_option(
-                scx.catalog.config().timestamp_frequency,
-                &mut with_options,
-            )?;
 
             if with_options.contains_key("start_offset") && consistency != Consistency::RealTime {
                 bail!("`start_offset` is not yet implemented for non-realtime consistency sources.")
@@ -516,10 +522,6 @@ pub fn plan_create_source(
                 None => Consistency::RealTime,
                 Some(_) => bail!("BYO consistency not supported for file sources"),
             };
-            ts_frequency = extract_timestamp_frequency_option(
-                scx.catalog.config().timestamp_frequency,
-                &mut with_options,
-            )?;
 
             let connector = ExternalSourceConnector::File(FileSourceConnector {
                 path: path.clone().into(),
@@ -579,8 +581,6 @@ pub fn plan_create_source(
             publication,
             slot,
         } => {
-            scx.require_experimental_mode("Postgres Sources")?;
-
             let slot_name = slot
                 .as_ref()
                 .ok_or_else(|| anyhow!("Postgres sources must provide a slot name"))?;
@@ -626,11 +626,6 @@ pub fn plan_create_source(
             if consistency != Consistency::RealTime {
                 bail!("BYO consistency is not supported for Avro OCF sources");
             }
-
-            ts_frequency = extract_timestamp_frequency_option(
-                scx.catalog.config().timestamp_frequency,
-                &mut with_options,
-            )?;
 
             let connector = ExternalSourceConnector::AvroOcf(FileSourceConnector {
                 path: path.clone().into(),
@@ -817,6 +812,41 @@ pub fn plan_create_source(
     };
     bare_desc =
         plan_utils::maybe_rename_columns(format!("source {}", name), bare_desc, &col_names)?;
+
+    // Apply user-specified key constraint
+    if let Some(KeyConstraint::PrimaryKeyNotEnforced { columns }) = key_constraint.clone() {
+        let key_columns = columns
+            .into_iter()
+            .map(normalize::column_name)
+            .collect::<Vec<_>>();
+
+        let mut uniq = HashSet::new();
+        for col in key_columns.iter() {
+            if !uniq.insert(col) {
+                bail!("Repeated column name in source key constraint: {}", col);
+            }
+        }
+
+        let key_indices = key_columns
+            .iter()
+            .map(|col| -> anyhow::Result<usize> {
+                let name_idx = bare_desc
+                    .get_by_name(col)
+                    .map(|(idx, _type)| idx)
+                    .ok_or_else(|| anyhow!("No such column in source key constraint: {}", col))?;
+                if bare_desc.get_unambiguous_name(name_idx).is_none() {
+                    bail!("Ambiguous column in source key constraint: {}", col);
+                }
+                Ok(name_idx)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if !bare_desc.typ().keys.is_empty() {
+            return Err(key_constraint_err(&bare_desc, &key_columns));
+        } else {
+            bare_desc = bare_desc.with_key(key_indices);
+        }
+    }
 
     // TODO(benesch): the available metadata columns should not depend
     // on the format.
@@ -1526,6 +1556,28 @@ fn invalid_upsert_key_err(desc: &RelationDesc, requested_user_key: &[ColumnName]
     anyhow!("Invalid upsert key: {}, {}", requested_user_key, valid_keys)
 }
 
+fn key_constraint_err(desc: &RelationDesc, user_keys: &[ColumnName]) -> anyhow::Error {
+    let user_keys = user_keys.iter().map(|column| column.as_str()).join(", ");
+
+    let existing_keys = desc
+        .typ()
+        .keys
+        .iter()
+        .map(|key_columns| {
+            key_columns
+                .iter()
+                .map(|col| desc.get_name(*col).expect("known to exist").as_str())
+                .join(", ")
+        })
+        .join(", ");
+
+    anyhow!(
+        "Key constraint ({}) conflicts with existing key ({})",
+        user_keys,
+        existing_keys
+    )
+}
+
 /// Returns only those `CatalogItem`s that don't have any other user
 /// dependencies. Those are the root dependencies.
 fn get_root_dependencies<'a>(
@@ -1776,20 +1828,6 @@ pub fn plan_create_type(
         typ: Type { create_sql, inner },
         depends_on: ids,
     }))
-}
-
-fn extract_timestamp_frequency_option(
-    default: Duration,
-    with_options: &mut BTreeMap<String, Value>,
-) -> Result<Duration, anyhow::Error> {
-    match with_options.remove("timestamp_frequency_ms") {
-        None => Ok(default),
-        Some(Value::Number(n)) => match n.parse::<u64>() {
-            Ok(n) => Ok(Duration::from_millis(n)),
-            _ => bail!("timestamp_frequency_ms must be an u64"),
-        },
-        Some(_) => bail!("timestamp_frequency_ms must be an u64"),
-    }
 }
 
 pub fn describe_create_role(

@@ -43,10 +43,11 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use self::prometheus::{Scraper, ScraperMessage};
 use anyhow::{anyhow, Context};
+use chrono::{DateTime, Utc};
 use derivative::Derivative;
 use differential_dataflow::lattice::Lattice;
 use futures::future::{self, FutureExt, TryFutureExt};
@@ -75,7 +76,7 @@ use expr::{
     ExprHumanizer, GlobalId, Id, MirRelationExpr, MirScalarExpr, NullaryFunc,
     OptimizedMirRelationExpr,
 };
-use ore::antichain::AntichainToken;
+use ore::now::{system_time, to_datetime, NowFn};
 use ore::str::StrExt;
 use ore::thread::{JoinHandleExt, JoinOnDropHandle};
 use repr::{ColumnName, Datum, RelationDesc, Row, Timestamp};
@@ -93,8 +94,8 @@ use sql::plan::{
     CreateIndexPlan, CreateRolePlan, CreateSchemaPlan, CreateSinkPlan, CreateSourcePlan,
     CreateTablePlan, CreateTypePlan, CreateViewPlan, CreateViewsPlan, DropDatabasePlan,
     DropItemsPlan, DropRolesPlan, DropSchemaPlan, ExplainPlan, FetchPlan, IndexOption,
-    IndexOptionName, InsertPlan, MutationKind, Params, PeekPlan, PeekWhen, Plan, PlanContext,
-    SendDiffsPlan, SetVariablePlan, ShowVariablePlan, Source, TailPlan,
+    IndexOptionName, InsertPlan, MutationKind, Params, PeekPlan, PeekWhen, Plan, SendDiffsPlan,
+    SetVariablePlan, ShowVariablePlan, Source, TailPlan,
 };
 use transform::Optimizer;
 
@@ -106,6 +107,7 @@ use crate::client::{Client, Handle};
 use crate::command::{
     Cancelled, Command, ExecuteResponse, Response, StartupMessage, StartupResponse,
 };
+use crate::coord::antichain::AntichainToken;
 use crate::error::CoordError;
 use crate::session::{
     EndTransactionAction, PreparedStatement, Session, TransactionOps, TransactionStatus, WriteOp,
@@ -114,6 +116,7 @@ use crate::sink_connector;
 use crate::timestamp::{TimestampMessage, Timestamper};
 use crate::util::ClientTransmitter;
 
+mod antichain;
 mod arrangement_state;
 mod dataflow_builder;
 mod prometheus;
@@ -225,6 +228,7 @@ pub struct Coordinator {
     /// A map from connection ID to metadata about that connection for all
     /// active connections.
     active_conns: HashMap<u32, ConnMeta>,
+    now: NowFn,
 
     /// Holds pending compaction messages to be sent to the dataflow workers. When
     /// `since_handles` are advanced or `txn_reads` are dropped, this can advance.
@@ -293,18 +297,17 @@ impl Coordinator {
         // This is a hack. In a perfect world we would represent time as having a "real" dimension
         // and a "coordinator" dimension so that clients always observed linearizability from
         // things the coordinator did without being related to the real dimension.
-        let ts = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("failed to get millis since epoch")
-            .as_millis()
-            .try_into()
-            .expect("current time did not fit into u64");
+        let ts = (self.now)();
 
         if ts < self.read_lower_bound {
             self.read_lower_bound
         } else {
             ts
         }
+    }
+
+    fn now_datetime(&self) -> DateTime<Utc> {
+        to_datetime((self.now)())
     }
 
     /// Generate a new frontiers object that forwards since changes to since_updates.
@@ -648,7 +651,7 @@ impl Coordinator {
             .and_then(|stmt| self.handle_statement(&mut session, stmt, &params))
             .await
         {
-            Ok((pcx, plan)) => self.sequence_plan(tx, session, pcx, plan).await,
+            Ok(plan) => self.sequence_plan(tx, session, plan).await,
             Err(e) => tx.send(Err(e), session),
         }
     }
@@ -794,7 +797,7 @@ impl Coordinator {
                             // Started is almost always safe (started means there's a single statement
                             // being executed). Failed transactions have already been checked in pgwire for
                             // a safe statement (COMMIT, ROLLBACK, etc.) and can also proceed.
-                            &TransactionStatus::Started(_) | &TransactionStatus::Failed => {
+                            &TransactionStatus::Started(_) | &TransactionStatus::Failed(_) => {
                                 if let Statement::Declare(_) = stmt {
                                     // Declare is an exception. Although it's not against any spec to execute
                                     // it, it will always result in nothing happening, since all portals will be
@@ -968,6 +971,22 @@ impl Coordinator {
                 self.handle_terminate(&mut session).await;
             }
 
+            Command::StartTransaction {
+                implicit,
+                session,
+                tx,
+            } => {
+                let now = self.now_datetime();
+                let session = match implicit {
+                    None => session.start_transaction(now),
+                    Some(stmts) => session.start_transaction_implicit(now, stmts),
+                };
+                let _ = tx.send(Response {
+                    result: Ok(()),
+                    session,
+                });
+            }
+
             Command::Commit {
                 action,
                 mut session,
@@ -1062,7 +1081,7 @@ impl Coordinator {
         session: &mut Session,
         stmt: sql::ast::Statement<Raw>,
         params: &sql::plan::Params,
-    ) -> Result<(PlanContext, sql::plan::Plan), CoordError> {
+    ) -> Result<sql::plan::Plan, CoordError> {
         let pcx = session.pcx();
 
         // When symbiosis mode is enabled, use symbiosis planning for:
@@ -1085,23 +1104,23 @@ impl Coordinator {
                 let plan = postgres
                     .execute(&pcx, &self.catalog.for_session(session), &stmt)
                     .await?;
-                return Ok((pcx, plan));
+                return Ok(plan);
             }
         }
 
         match sql::plan::plan(
-            &pcx,
+            Some(&pcx),
             &self.catalog.for_session(session),
             stmt.clone(),
             params,
         ) {
-            Ok(plan) => Ok((pcx, plan)),
+            Ok(plan) => Ok(plan),
             Err(err) => match self.symbiosis {
                 Some(ref mut postgres) if postgres.can_handle(&stmt) => {
                     let plan = postgres
                         .execute(&pcx, &self.catalog.for_session(session), &stmt)
                         .await?;
-                    Ok((pcx, plan))
+                    Ok(plan)
                 }
                 _ => Err(err.into()),
             },
@@ -1121,7 +1140,7 @@ impl Coordinator {
             &self.catalog.for_session(session),
             stmt.clone(),
             &param_types,
-            Some(session),
+            session,
         )?;
         let params = vec![];
         let result_formats = vec![pgrepr::Format::Text; desc.arity()];
@@ -1141,7 +1160,7 @@ impl Coordinator {
                 &self.catalog.for_session(session),
                 stmt.clone(),
                 &param_types,
-                Some(session),
+                session,
             ) {
                 Ok(desc) => desc,
                 // Describing the query failed. If we're running in symbiosis with
@@ -1266,7 +1285,6 @@ impl Coordinator {
         &mut self,
         tx: ClientTransmitter<ExecuteResponse>,
         mut session: Session,
-        pcx: PlanContext,
         plan: Plan,
     ) {
         match plan {
@@ -1281,36 +1299,33 @@ impl Coordinator {
             }
             Plan::CreateTable(plan) => {
                 tx.send(
-                    self.sequence_create_table(&mut session, pcx, plan).await,
+                    self.sequence_create_table(&mut session, plan).await,
                     session,
                 );
             }
             Plan::CreateSource(plan) => {
                 tx.send(
-                    self.sequence_create_source(&mut session, pcx, plan).await,
+                    self.sequence_create_source(&mut session, plan).await,
                     session,
                 );
             }
             Plan::CreateSink(plan) => {
-                self.sequence_create_sink(session, pcx, plan, tx).await;
+                self.sequence_create_sink(session, plan, tx).await;
             }
             Plan::CreateView(plan) => {
-                tx.send(
-                    self.sequence_create_view(&mut session, pcx, plan).await,
-                    session,
-                );
+                tx.send(self.sequence_create_view(&mut session, plan).await, session);
             }
             Plan::CreateViews(plan) => {
                 tx.send(
-                    self.sequence_create_views(&mut session, pcx, plan).await,
+                    self.sequence_create_views(&mut session, plan).await,
                     session,
                 );
             }
             Plan::CreateIndex(plan) => {
-                tx.send(self.sequence_create_index(pcx, plan).await, session);
+                tx.send(self.sequence_create_index(plan).await, session);
             }
             Plan::CreateType(plan) => {
-                tx.send(self.sequence_create_type(pcx, plan).await, session);
+                tx.send(self.sequence_create_type(plan).await, session);
             }
             Plan::DropDatabase(plan) => {
                 tx.send(self.sequence_drop_database(plan).await, session);
@@ -1342,7 +1357,7 @@ impl Coordinator {
             Plan::StartTransaction => {
                 let duplicated =
                     matches!(session.transaction(), TransactionStatus::InTransaction(_));
-                session.start_transaction();
+                let session = session.start_transaction(self.now_datetime());
                 tx.send(
                     Ok(ExecuteResponse::StartedTransaction { duplicated }),
                     session,
@@ -1516,7 +1531,6 @@ impl Coordinator {
     async fn sequence_create_table(
         &mut self,
         session: &Session,
-        pcx: PlanContext,
         plan: CreateTablePlan,
     ) -> Result<ExecuteResponse, CoordError> {
         let CreateTablePlan {
@@ -1536,7 +1550,6 @@ impl Coordinator {
         index_depends_on.push(table_id);
         let table = catalog::Table {
             create_sql: table.create_sql,
-            plan_cx: pcx,
             desc: table.desc,
             defaults: table.defaults,
             conn_id,
@@ -1592,7 +1605,6 @@ impl Coordinator {
     async fn sequence_create_source(
         &mut self,
         session: &mut Session,
-        pcx: PlanContext,
         plan: CreateSourcePlan,
     ) -> Result<ExecuteResponse, CoordError> {
         // TODO(petrosagg): remove this check once postgres sources are properly supported
@@ -1614,7 +1626,7 @@ impl Coordinator {
         }
 
         let if_not_exists = plan.if_not_exists;
-        let (metadata, ops) = self.generate_create_source_ops(session, pcx, vec![plan])?;
+        let (metadata, ops) = self.generate_create_source_ops(session, vec![plan])?;
         match self.catalog_transact(ops).await {
             Ok(()) => {
                 self.ship_sources(metadata).await;
@@ -1648,7 +1660,6 @@ impl Coordinator {
     fn generate_create_source_ops(
         &mut self,
         session: &mut Session,
-        pcx: PlanContext,
         plans: Vec<CreateSourcePlan>,
     ) -> Result<(Vec<(GlobalId, Option<GlobalId>, bool)>, Vec<catalog::Op>), CoordError> {
         let mut metadata = vec![];
@@ -1666,7 +1677,6 @@ impl Coordinator {
             let transformed_desc = RelationDesc::new(optimized_expr.0.typ(), source.column_names);
             let source = catalog::Source {
                 create_sql: source.create_sql,
-                plan_cx: pcx.clone(),
                 optimized_expr,
                 connector: source.connector,
                 bare_desc: source.bare_desc,
@@ -1715,7 +1725,6 @@ impl Coordinator {
     async fn sequence_create_sink(
         &mut self,
         session: Session,
-        pcx: PlanContext,
         plan: CreateSinkPlan,
         tx: ClientTransmitter<ExecuteResponse>,
     ) {
@@ -1755,7 +1764,6 @@ impl Coordinator {
             name,
             item: CatalogItem::Sink(catalog::Sink {
                 create_sql: sink.create_sql,
-                plan_cx: pcx,
                 from: sink.from,
                 connector: catalog::SinkConnectorState::Pending(sink.connector_builder.clone()),
                 envelope: sink.envelope,
@@ -1798,7 +1806,6 @@ impl Coordinator {
     fn generate_view_ops(
         &mut self,
         session: &Session,
-        pcx: PlanContext,
         plan: CreateViewPlan,
     ) -> Result<(Vec<catalog::Op>, Option<GlobalId>), CoordError> {
         let CreateViewPlan {
@@ -1824,7 +1831,6 @@ impl Coordinator {
         let desc = RelationDesc::new(optimized_expr.typ(), view.column_names);
         let view = catalog::View {
             create_sql: view.create_sql,
-            plan_cx: pcx,
             optimized_expr,
             desc,
             conn_id: if view.temporary {
@@ -1874,11 +1880,10 @@ impl Coordinator {
     async fn sequence_create_view(
         &mut self,
         session: &Session,
-        pcx: PlanContext,
         plan: CreateViewPlan,
     ) -> Result<ExecuteResponse, CoordError> {
         let if_not_exists = plan.if_not_exists;
-        let (ops, index_id) = self.generate_view_ops(session, pcx, plan)?;
+        let (ops, index_id) = self.generate_view_ops(session, plan)?;
 
         match self.catalog_transact(ops).await {
             Ok(()) => {
@@ -1899,14 +1904,13 @@ impl Coordinator {
     async fn sequence_create_views(
         &mut self,
         session: &mut Session,
-        pcx: PlanContext,
         plan: CreateViewsPlan,
     ) -> Result<ExecuteResponse, CoordError> {
         let mut ops = vec![];
         let mut index_ids = vec![];
 
         for view_plan in plan.views {
-            let (mut view_ops, index_id) = self.generate_view_ops(session, pcx, view_plan)?;
+            let (mut view_ops, index_id) = self.generate_view_ops(session, view_plan)?;
             ops.append(&mut view_ops);
             if let Some(index_id) = index_id {
                 index_ids.push(index_id);
@@ -1931,7 +1935,6 @@ impl Coordinator {
 
     async fn sequence_create_index(
         &mut self,
-        pcx: PlanContext,
         plan: CreateIndexPlan,
     ) -> Result<ExecuteResponse, CoordError> {
         let CreateIndexPlan {
@@ -1947,7 +1950,6 @@ impl Coordinator {
         }
         let index = catalog::Index {
             create_sql: index.create_sql,
-            plan_cx: pcx,
             keys: index.keys,
             on: index.on,
             conn_id: None,
@@ -1978,12 +1980,10 @@ impl Coordinator {
 
     async fn sequence_create_type(
         &mut self,
-        pcx: PlanContext,
         plan: CreateTypePlan,
     ) -> Result<ExecuteResponse, CoordError> {
         let typ = catalog::Type {
             create_sql: plan.typ.create_sql,
-            plan_cx: pcx,
             inner: plan.typ.inner.into(),
             depends_on: plan.depends_on,
         };
@@ -2109,36 +2109,34 @@ impl Coordinator {
         // `update_upper`.
 
         if let EndTransactionAction::Commit = action {
-            match txn {
-                TransactionStatus::Default | TransactionStatus::Failed => {}
-                TransactionStatus::Started(ops)
-                | TransactionStatus::InTransaction(ops)
-                | TransactionStatus::InTransactionImplicit(ops) => {
-                    match ops {
-                        TransactionOps::Writes(inserts) => {
-                            let timestamp = self.get_write_ts();
-                            for WriteOp { id, rows } in inserts {
-                                // Re-verify this id exists.
-                                if self.catalog.try_get_by_id(id).is_none() {
-                                    return Err(CoordError::SqlCatalog(CatalogError::UnknownItem(
-                                        id.to_string(),
-                                    )));
-                                }
-
-                                let updates: Vec<_> = rows
-                                    .into_iter()
-                                    .map(|(row, diff)| Update {
-                                        row,
-                                        diff,
-                                        timestamp,
-                                    })
-                                    .collect();
-
-                                self.broadcast(SequencedCommand::Insert { id, updates });
+            if let Some(ops) = txn.into_ops() {
+                match ops {
+                    TransactionOps::Writes(inserts) => {
+                        // Although the transaction has a wall_time in its pcx, we use a new
+                        // coordinator timestamp here to provide linearizability. The wall_time does
+                        // not have to relate to the write time.
+                        let timestamp = self.get_write_ts();
+                        for WriteOp { id, rows } in inserts {
+                            // Re-verify this id exists.
+                            if self.catalog.try_get_by_id(id).is_none() {
+                                return Err(CoordError::SqlCatalog(CatalogError::UnknownItem(
+                                    id.to_string(),
+                                )));
                             }
+
+                            let updates: Vec<_> = rows
+                                .into_iter()
+                                .map(|(row, diff)| Update {
+                                    row,
+                                    diff,
+                                    timestamp,
+                                })
+                                .collect();
+
+                            self.broadcast(SequencedCommand::Insert { id, updates });
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
             }
         }
@@ -2160,7 +2158,9 @@ impl Coordinator {
         source_timeline: &Option<Timeline>,
         conn_id: u32,
     ) -> Result<Vec<GlobalId>, CoordError> {
-        let mut timedomain_ids = self.catalog.schema_adjacent_relations(&source_ids, conn_id);
+        let mut timedomain_ids = self
+            .catalog
+            .schema_adjacent_indexed_relations(&source_ids, conn_id);
 
         // Filter out ids from different timelines. The timeline code only verifies
         // that the SELECT doesn't cross timelines. The schema-adjacent code looks
@@ -2361,8 +2361,7 @@ impl Coordinator {
                 dataflow.set_as_of(Antichain::from_elem(timestamp));
                 self.dataflow_builder()
                     .import_view_into_dataflow(&view_id, &source, &mut dataflow);
-                dataflow.add_index_to_build(index_id, view_id, typ.clone(), key.clone());
-                dataflow.add_index_export(index_id, view_id, typ, key);
+                dataflow.export_index(index_id, view_id, typ, key);
                 self.ship_dataflow(dataflow).await;
             }
 
@@ -2805,7 +2804,7 @@ impl Coordinator {
         rows: Vec<Row>,
     ) -> Result<ExecuteResponse, CoordError> {
         let catalog = self.catalog.for_session(session);
-        let values = sql::plan::plan_copy_from(&catalog, id, columns, rows)?;
+        let values = sql::plan::plan_copy_from(&session.pcx(), &catalog, id, columns, rows)?;
         let plan = InsertPlan {
             id,
             values: values.lower(),
@@ -3315,6 +3314,7 @@ pub async fn serve(
         build_info,
         num_workers: workers,
         timestamp_frequency,
+        now: system_time,
     })?;
     let cluster_id = catalog.config().cluster_id;
     let session_id = catalog.config().session_id;
@@ -3326,6 +3326,7 @@ pub async fn serve(
         command_receivers: worker_rxs,
         timely_worker,
         experimental_mode,
+        now: system_time,
     })
     .map_err(|s| CoordError::Unstructured(anyhow!("{}", s)))?;
 
@@ -3380,6 +3381,7 @@ pub async fn serve(
     let thread = thread::Builder::new()
         .name("coordinator".to_string())
         .spawn(move || {
+            let now = catalog.config().now;
             let mut coord = Coordinator {
                 worker_guards,
                 worker_txs,
@@ -3407,6 +3409,7 @@ pub async fn serve(
                 since_handles: HashMap::new(),
                 since_updates: Rc::new(RefCell::new(HashMap::new())),
                 sink_writes: HashMap::new(),
+                now,
             };
             coord.broadcast(SequencedCommand::EnableFeedback(feedback_tx));
             if let Some(config) = &logging {
@@ -3493,7 +3496,6 @@ fn auto_generate_primary_idx(
     let default_key = on_desc.typ().default_key();
     catalog::Index {
         create_sql: index_sql(index_name, on_name, &on_desc, &default_key),
-        plan_cx: PlanContext::default(),
         on: on_id,
         keys: default_key
             .iter()
@@ -3553,21 +3555,23 @@ pub fn describe(
     catalog: &dyn sql::catalog::Catalog,
     stmt: Statement<Raw>,
     param_types: &[Option<pgrepr::Type>],
-    session: Option<&Session>,
+    session: &mut Session,
 ) -> Result<StatementDesc, CoordError> {
     match stmt {
         // FETCH's description depends on the current session, which describe_statement
         // doesn't (and shouldn't?) have access to, so intercept it here.
         Statement::Fetch(FetchStatement { ref name, .. }) => {
-            match session
-                .map(|session| session.get_portal(name.as_str()).map(|p| p.desc.clone()))
-                .flatten()
-            {
+            match session.get_portal(name.as_str()).map(|p| p.desc.clone()) {
                 Some(desc) => Ok(desc),
                 None => Err(CoordError::UnknownCursor(name.to_string())),
             }
         }
-        _ => Ok(sql::plan::describe(catalog, stmt, param_types)?),
+        _ => Ok(sql::plan::describe(
+            &session.pcx(),
+            catalog,
+            stmt,
+            param_types,
+        )?),
     }
 }
 

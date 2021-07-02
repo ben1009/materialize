@@ -430,7 +430,7 @@ impl AstDisplay for Connector {
                 publication,
                 slot,
             } => {
-                f.write_str("POSTGRES HOST '");
+                f.write_str("POSTGRES CONNECTION '");
                 f.write_str(&display::escape_single_quote_string(conn));
                 f.write_str("' PUBLICATION '");
                 f.write_str(&display::escape_single_quote_string(publication));
@@ -576,6 +576,28 @@ impl<T: AstInfo> AstDisplay for TableConstraint<T> {
     }
 }
 impl_display_t!(TableConstraint);
+
+/// A key constraint, specified in a `CREATE SOURCE`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum KeyConstraint {
+    // PRIMARY KEY (<columns>) NOT ENFORCED
+    PrimaryKeyNotEnforced { columns: Vec<Ident> },
+}
+
+impl AstDisplay for KeyConstraint {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        match self {
+            KeyConstraint::PrimaryKeyNotEnforced { columns } => {
+                f.write_str("PRIMARY KEY ");
+                f.write_str("(");
+                f.write_node(&display::comma_separated(columns));
+                f.write_str(") ");
+                f.write_str("NOT ENFORCED");
+            }
+        }
+    }
+}
+impl_display!(KeyConstraint);
 
 /// SQL column definition
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

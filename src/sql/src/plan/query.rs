@@ -62,9 +62,8 @@ use crate::plan::expr::{
 use crate::plan::plan_utils;
 use crate::plan::scope::{Scope, ScopeItem, ScopeItemName};
 use crate::plan::statement::StatementContext;
-use crate::plan::transform_ast;
 use crate::plan::typeconv::{self, CastContext};
-use crate::plan::PlanContext;
+use crate::plan::{transform_ast, PlanContext};
 
 // Aug is the type variable assigned to an AST that has already been
 // name-resolved. An AST in this state has global IDs populated next to table
@@ -409,7 +408,7 @@ pub fn plan_insert_query(
     columns: Vec<Ident>,
     source: InsertSource<Raw>,
 ) -> Result<(GlobalId, HirRelationExpr), anyhow::Error> {
-    let mut qcx = QueryContext::root(scx, QueryLifetime::OneShot);
+    let mut qcx = QueryContext::root(scx, QueryLifetime::OneShot(scx.pcx()?));
     let table = scx.resolve_item(table_name)?;
 
     // Validate the target of the insert.
@@ -618,6 +617,7 @@ pub fn plan_copy_from(
 /// Builds a plan that adds the default values for the missing columns and re-orders
 /// the datums in the given rows to match the order in the target table.
 pub fn plan_copy_from_rows(
+    pcx: &PlanContext,
     catalog: &dyn Catalog,
     id: GlobalId,
     columns: Vec<usize>,
@@ -653,12 +653,11 @@ pub fn plan_copy_from_rows(
     // Maps from table column index to position in the source query
     let col_to_source: HashMap<_, _> = columns.iter().enumerate().map(|(a, b)| (b, a)).collect();
 
-    let scx = StatementContext {
-        pcx: &PlanContext::default(),
+    let scx = StatementContext::new(
+        Some(pcx),
         catalog,
-        ids: HashSet::new(),
-        param_types: std::rc::Rc::new(RefCell::new(BTreeMap::new())),
-    };
+        std::rc::Rc::new(RefCell::new(BTreeMap::new())),
+    );
 
     let column_details = desc.iter_types().zip_eq(defaults).enumerate();
     for (col_idx, (col_typ, default)) in column_details {
@@ -700,34 +699,34 @@ where
         allow_aggregates: false,
         allow_subqueries: true,
     };
-    let source_types = ecx
-        .relation_type
-        .column_types
-        .iter()
-        .map(|typ| &typ.scalar_type);
     let mut map_exprs = vec![];
     let mut project_key = vec![];
-    for (i, (typ, target_typ)) in source_types.zip_eq(target_types).enumerate() {
-        if typ != target_typ {
-            let expr = HirScalarExpr::Column(ColumnRef {
-                level: 0,
-                column: i,
-            });
-            match typeconv::plan_cast("relation cast", ecx, ccx, expr, target_typ) {
-                Ok(expr) => {
+    for (i, target_typ) in target_types.into_iter().enumerate() {
+        let expr = HirScalarExpr::Column(ColumnRef {
+            level: 0,
+            column: i,
+        });
+        // We plan every cast and check the evaluated expressions rather than
+        // checking the types directly because of some complex casting rules
+        // between types not expressed in `ScalarType` equality.
+        match typeconv::plan_cast("relation cast", ecx, ccx, expr.clone(), target_typ) {
+            Ok(cast_expr) => {
+                if expr == cast_expr {
+                    // Cast between types was unnecessary
+                    project_key.push(i);
+                } else {
+                    // Cast between types required
                     project_key.push(ecx.relation_type.arity() + map_exprs.len());
-                    map_exprs.push(expr);
-                }
-                Err(_) => {
-                    return Err(CastRelationError {
-                        column: i,
-                        source_type: typ.clone(),
-                        target_type: target_typ.clone(),
-                    });
+                    map_exprs.push(cast_expr);
                 }
             }
-        } else {
-            project_key.push(i);
+            Err(_) => {
+                return Err(CastRelationError {
+                    column: i,
+                    source_type: ecx.scalar_type(&expr),
+                    target_type: target_typ.clone(),
+                });
+            }
         }
     }
     Ok(expr.map(map_exprs).project(project_key))
@@ -744,7 +743,7 @@ pub fn eval_as_of<'a>(
         Some(Scope::empty(None)),
     );
     let desc = RelationDesc::empty();
-    let mut qcx = QueryContext::root(scx, QueryLifetime::OneShot);
+    let mut qcx = QueryContext::root(scx, QueryLifetime::OneShot(scx.pcx()?));
 
     transform_ast::transform_expr(scx, &mut expr)?;
 
@@ -786,7 +785,7 @@ pub fn plan_default_expr(
     expr: &Expr<Raw>,
     target_ty: &ScalarType,
 ) -> Result<(HirScalarExpr, Vec<GlobalId>), anyhow::Error> {
-    let mut qcx = QueryContext::root(scx, QueryLifetime::OneShot);
+    let mut qcx = QueryContext::root(scx, QueryLifetime::OneShot(scx.pcx()?));
     let expr = resolve_names_expr(&mut qcx, expr.clone())?;
     let ecx = &ExprContext {
         qcx: &qcx,
@@ -3307,9 +3306,9 @@ impl<'a, 'ast> Visit<'ast, Aug> for AggregateFuncVisitor<'a, 'ast> {
 /// allowed to reason about the time at which it is running, e.g., by calling
 /// the `now()` function.
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]
-pub enum QueryLifetime {
+pub enum QueryLifetime<'a> {
     /// The query's result will be computed at one point in time.
-    OneShot,
+    OneShot(&'a PlanContext),
     /// The query's result will be maintained indefinitely.
     Static,
 }
@@ -3333,7 +3332,7 @@ pub struct QueryContext<'a> {
     /// The context for the containing `Statement`.
     pub scx: &'a StatementContext<'a>,
     /// The lifetime that the planned query will have.
-    pub lifetime: QueryLifetime,
+    pub lifetime: QueryLifetime<'a>,
     /// The scope of the outer relation expression.
     pub outer_scope: Scope,
     /// The type of the outer relation expressions.
@@ -3345,7 +3344,7 @@ pub struct QueryContext<'a> {
 }
 
 impl<'a> QueryContext<'a> {
-    pub fn root(scx: &'a StatementContext, lifetime: QueryLifetime) -> QueryContext<'a> {
+    pub fn root(scx: &'a StatementContext, lifetime: QueryLifetime<'a>) -> QueryContext<'a> {
         QueryContext {
             scx,
             lifetime,

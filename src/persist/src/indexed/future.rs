@@ -17,7 +17,8 @@ use timely::progress::{Antichain, Timestamp};
 
 use crate::error::Error;
 use crate::indexed::cache::BlobCache;
-use crate::indexed::{BlobFutureBatch, BlobFutureMeta};
+use crate::indexed::encoding::BlobFutureMeta;
+use crate::indexed::BlobFutureBatch;
 use crate::persister::Snapshot;
 use crate::storage::{Blob, SeqNo};
 
@@ -129,6 +130,7 @@ impl BlobFuture {
 }
 
 /// A consistent snapshot of the data currently in a persistent [BlobFuture].
+#[derive(Debug)]
 pub struct FutureSnapshot {
     /// An open upper bound on the seqnos of contained updates.
     pub seqno_upper: Antichain<SeqNo>,

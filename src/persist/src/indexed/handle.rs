@@ -8,70 +8,80 @@
 // by the Apache License, Version 2.0.
 
 //! The public API used by the rest of the crate for interacting with an
-//! instance of [Indexed].
+//! instance of [crate::indexed::Indexed] via [RuntimeClient].
 
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::mpsc;
 
 use crate::error::Error;
-use crate::indexed::{Indexed, IndexedSnapshot};
-use crate::persister::{Meta, Write};
-use crate::storage::{Blob, Buffer};
-use crate::Id;
+use crate::indexed::encoding::Id;
+use crate::indexed::runtime::RuntimeClient;
+use crate::indexed::IndexedSnapshot;
 
-/// An implementation of [Write] in terms of an [Indexed].
-pub struct StreamWriteHandle<U: Buffer, L: Blob> {
+/// A handle that allows writes of ((Key, Value), Time, Diff) updates into an
+/// [crate::indexed::Indexed] via a [RuntimeClient].
+pub struct StreamWriteHandle {
     id: Id,
-    indexed: Arc<Mutex<Indexed<U, L>>>,
+    runtime: RuntimeClient,
 }
 
-impl<U: Buffer, L: Blob> Write for StreamWriteHandle<U, L> {
-    fn write_sync(&mut self, updates: &[((String, String), u64, isize)]) -> Result<(), Error> {
-        self.indexed.lock()?.write_sync(self.id, updates)
-    }
-
-    fn seal(&mut self, upper: u64) -> Result<(), Error> {
-        self.indexed.lock()?.seal(self.id, upper)
-    }
-}
-
-impl<U: Buffer, L: Blob> StreamWriteHandle<U, L> {
+impl StreamWriteHandle {
     /// Returns a new [StreamWriteHandle] for the given stream.
-    pub fn new(id: Id, indexed: Arc<Mutex<Indexed<U, L>>>) -> Self {
-        StreamWriteHandle { id, indexed }
+    pub fn new(id: Id, runtime: RuntimeClient) -> Self {
+        StreamWriteHandle { id, runtime }
+    }
+
+    /// Synchronously writes (Key, Value, Time, Diff) updates.
+    pub fn write_sync(&mut self, updates: &[((String, String), u64, isize)]) -> Result<(), Error> {
+        // TODO: Make Write::write_sync signature non-blocking.
+        let (rx, tx) = mpsc::channel();
+        self.runtime.write(self.id, updates, rx.into());
+        tx.recv().map_err(|_| Error::RuntimeShutdown)?
+    }
+
+    /// Closes the stream at the given timestamp, migrating data strictly less
+    /// than it into the trace.
+    pub fn seal(&mut self, upper: u64) -> Result<(), Error> {
+        // TODO: Make Write::write_sync signature non-blocking.
+        let (rx, tx) = mpsc::channel();
+        self.runtime.seal(self.id, upper, rx.into());
+        tx.recv().map_err(|_| Error::RuntimeShutdown)?
     }
 }
 
-/// An implementation of [Meta] in terms of an [Indexed].
-pub struct StreamMetaHandle<U: Buffer, L: Blob> {
+/// A handle for a persisted stream of ((Key, Value), Time, Diff) updates backed
+/// by an [crate::indexed::Indexed] via a [RuntimeClient].
+pub struct StreamMetaHandle {
     id: Id,
-    indexed: Arc<Mutex<Indexed<U, L>>>,
+    runtime: RuntimeClient,
 }
 
-impl<U: Buffer, L: Blob> Clone for StreamMetaHandle<U, L> {
+impl Clone for StreamMetaHandle {
     fn clone(&self) -> Self {
         StreamMetaHandle {
             id: self.id,
-            indexed: self.indexed.clone(),
+            runtime: self.runtime.clone(),
         }
     }
 }
 
-impl<U: Buffer, L: Blob> StreamMetaHandle<U, L> {
+impl StreamMetaHandle {
     /// Returns a new [StreamMetaHandle] for the given stream.
-    pub fn new(id: Id, indexed: Arc<Mutex<Indexed<U, L>>>) -> Self {
-        StreamMetaHandle { id, indexed }
-    }
-}
-
-impl<U: Buffer, L: Blob> Meta for StreamMetaHandle<U, L> {
-    type Snapshot = IndexedSnapshot;
-
-    fn snapshot(&self) -> Result<Self::Snapshot, Error> {
-        self.indexed.lock()?.snapshot(self.id)
+    pub fn new(id: Id, runtime: RuntimeClient) -> Self {
+        StreamMetaHandle { id, runtime }
     }
 
-    fn allow_compaction(&mut self, _ts: u64) -> Result<(), Error> {
+    /// Returns a consistent snapshot of all previously persisted stream data.
+    pub fn snapshot(&self) -> Result<IndexedSnapshot, Error> {
+        // TODO: Make Meta::snapshot signature non-blocking.
+        let (rx, tx) = mpsc::channel();
+        self.runtime.snapshot(self.id, rx.into());
+        tx.recv()
+            .map_err(|_| Error::RuntimeShutdown)
+            .and_then(std::convert::identity)
+    }
+
+    /// Unblocks compaction for updates before a time.
+    pub fn allow_compaction(&mut self, _ts: u64) -> Result<(), Error> {
         // No-op for now.
         Ok(())
     }

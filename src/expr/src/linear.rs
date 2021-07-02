@@ -290,6 +290,13 @@ impl MapFilterProject {
             .project(0..old_projection_len)
     }
 
+    /// Returns `self`, and leaves behind an identity operator that acts on its output.
+    pub fn take(&mut self) -> Self {
+        let mut identity = Self::new(self.projection.len());
+        std::mem::swap(self, &mut identity);
+        identity
+    }
+
     /// Convert the `MapFilterProject` into a staged evaluation plan.
     ///
     /// The main behavior is extract temporal predicates, which cannot be evaluated
@@ -1439,11 +1446,6 @@ pub mod plan {
             } else {
                 None.into_iter().chain(None.into_iter())
             }
-        }
-
-        /// True when `self` contains no temporal predicates.
-        pub fn non_temporal(&self) -> bool {
-            self.lower_bounds.is_empty() && self.upper_bounds.is_empty()
         }
     }
 }

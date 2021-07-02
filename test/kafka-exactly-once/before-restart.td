@@ -68,14 +68,23 @@ $ kafka-create-topic topic=input-consistency
 
 $ kafka-create-topic topic=input
 
+> CREATE MATERIALIZED SOURCE input_rt
+  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-input-${testdrive.seed}'
+  FORMAT AVRO USING SCHEMA '${schema}' ENVELOPE DEBEZIUM
+
+> CREATE SINK output2 FROM input_rt
+  INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'output-rt-sink-${testdrive.seed}'
+  WITH (exactly_once=true, consistency_topic='output-rt-sink-consistency-${testdrive.seed}')
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
+
 > CREATE MATERIALIZED SOURCE input_byo
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-input-${testdrive.seed}'
     WITH (consistency_topic = 'testdrive-input-consistency-${testdrive.seed}')
   FORMAT AVRO USING SCHEMA '${schema}' ENVELOPE DEBEZIUM
 
 > CREATE SINK output FROM input_byo
-  INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'output-sink-${testdrive.seed}'
-  WITH (exactly_once=true, consistency_topic='output-sink-consistency-${testdrive.seed}')
+  INTO KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'output-byo-sink-${testdrive.seed}'
+  WITH (exactly_once=true, consistency_topic='output-byo-sink-consistency-${testdrive.seed}')
   FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
 
 $ kafka-ingest format=avro topic=input-consistency timestamp=1 schema=${trxschemakey}
@@ -120,6 +129,27 @@ $ kafka-verify format=avro sink=materialize.public.output sort-messages=true
 {"before": null, "after": {"row": {"a": 5, "b": 6}}, "transaction": {"id": "3"}}
 
 > SELECT * FROM input_byo
+a  b
+------
+1   1
+2   1
+3   1
+1   2
+11  11
+22  11
+3   4
+5   6
+
+# Reingest the sink based on rt sources to confirm correct output.
+# TODO: this needs to have deduplication='none' because the deduplication code expects
+# certain fields that the sink does not emit
+> CREATE MATERIALIZED SOURCE reingest_rt_sink
+  FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'output-rt-sink-${testdrive.seed}'
+  WITH (deduplication='none')
+  FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY '${testdrive.schema-registry-url}'
+  ENVELOPE DEBEZIUM
+
+> SELECT * FROM reingest_rt_sink
 a  b
 ------
 1   1

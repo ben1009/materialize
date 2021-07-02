@@ -59,6 +59,7 @@ Commit
 Committed
 Compression
 Confluent
+Connection
 Constraint
 Copy
 Create
@@ -86,6 +87,7 @@ Double
 Drop
 Else
 End
+Enforced
 Envelope
 Except
 Exists
@@ -113,7 +115,6 @@ Having
 Header
 Headers
 Hold
-Host
 Hour
 Hours
 If

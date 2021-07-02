@@ -46,6 +46,13 @@ Use relative links (/path/to/doc), not absolute links
 Wrap your release notes at the 80 character mark.
 {{< /comment >}}
 
+- Stabilized [postgres sources](/sql/create-source/postgres) (no longer require
+  `--experimental`)
+
+- **Breaking change.** `HOST` keyword when creating
+  [postgres sources](/sql/create-source/postgres/#syntax) has been renamed to
+  `CONNECTION`.
+
 {{% version-header v0.8.1 %}}
 
 - Add [timelines](/sql/timelines) to all sources to prevent
@@ -60,6 +67,25 @@ Wrap your release notes at the 80 character mark.
 - Add the [`kafka_time_offset`](/sql/create-source/avro-kafka/#with-options)
   `WITH` option for Kafka sources, which allows to set `start_offset` based on
   Kafka timestamps.
+
+- **Breaking change.** The `timezone(String, Time)` function can no
+  longer be used in views.
+
+- Debezium sinks
+  emit [`collection_data`](/sql/create-sink/#consistency-metadata) attributes in
+  their consistency topic.
+
+- **Breaking change.** Renamed the `timestamp`, `diff`, and `progressed`
+  columns in [`TAIL`](/sql/tail) to `mz_timestamp`, `mz_diff`, and
+  `mz_progressed`.
+
+- Add the [`current_role`](/sql/functions/#system-information-func) system
+  information function.
+
+- Support manually declaring a [`(non-enforced) primary key`](/sql/create-source/avro-kafka/#key-constraint-details)
+  on sources.
+
+- S3 sources retry failed requests to list buckets and download objects.
 
 {{% version-header v0.8.0 %}}
 

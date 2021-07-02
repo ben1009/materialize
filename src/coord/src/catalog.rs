@@ -22,6 +22,7 @@ use itertools::Itertools;
 use lazy_static::lazy_static;
 use log::{info, trace};
 use ore::collections::CollectionExt;
+use ore::now::{to_datetime, EpochMillis, NowFn};
 use regex::Regex;
 use repr::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -29,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use build_info::DUMMY_BUILD_INFO;
 use dataflow_types::{SinkConnector, SinkConnectorBuilder, SourceConnector, Timeline};
 use expr::{ExprHumanizer, GlobalId, MirScalarExpr, OptimizedMirRelationExpr};
-use repr::{ColumnType, RelationDesc, ScalarType};
+use repr::{RelationDesc, ScalarType};
 use sql::ast::display::AstDisplay;
 use sql::ast::{Expr, Raw};
 use sql::catalog::{
@@ -55,7 +56,6 @@ use crate::session::Session;
 mod builtin_table_updates;
 mod config;
 mod error;
-mod metrics;
 mod migrate;
 
 pub mod builtin;
@@ -174,7 +174,6 @@ pub enum CatalogItem {
 #[derive(Debug, Clone, Serialize)]
 pub struct Table {
     pub create_sql: String,
-    pub plan_cx: PlanContext,
     pub desc: RelationDesc,
     #[serde(skip)]
     pub defaults: Vec<Expr<Raw>>,
@@ -193,7 +192,6 @@ impl Table {
 #[derive(Debug, Clone, Serialize)]
 pub struct Source {
     pub create_sql: String,
-    pub plan_cx: PlanContext,
     pub optimized_expr: OptimizedMirRelationExpr,
     pub connector: SourceConnector,
     pub bare_desc: RelationDesc,
@@ -203,7 +201,6 @@ pub struct Source {
 #[derive(Debug, Clone, Serialize)]
 pub struct Sink {
     pub create_sql: String,
-    pub plan_cx: PlanContext,
     pub from: GlobalId,
     pub connector: SinkConnectorState,
     pub envelope: SinkEnvelope,
@@ -220,7 +217,6 @@ pub enum SinkConnectorState {
 #[derive(Debug, Clone, Serialize)]
 pub struct View {
     pub create_sql: String,
-    pub plan_cx: PlanContext,
     pub optimized_expr: OptimizedMirRelationExpr,
     pub desc: RelationDesc,
     pub conn_id: Option<u32>,
@@ -230,7 +226,6 @@ pub struct View {
 #[derive(Debug, Clone, Serialize)]
 pub struct Index {
     pub create_sql: String,
-    pub plan_cx: PlanContext,
     pub on: GlobalId,
     pub keys: Vec<MirScalarExpr>,
     pub conn_id: Option<u32>,
@@ -240,7 +235,6 @@ pub struct Index {
 #[derive(Debug, Clone, Serialize)]
 pub struct Type {
     pub create_sql: String,
-    pub plan_cx: PlanContext,
     pub inner: TypeInner,
     pub depends_on: Vec<GlobalId>,
 }
@@ -272,7 +266,6 @@ impl From<sql::plan::TypeInner> for TypeInner {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Func {
-    pub plan_cx: PlanContext,
     #[serde(skip)]
     pub inner: &'static sql::func::Func,
 }
@@ -509,7 +502,7 @@ impl Catalog {
             storage: Arc::new(Mutex::new(storage)),
             oid_counter: FIRST_USER_OID,
             config: sql::catalog::CatalogConfig {
-                start_time: Utc::now(),
+                start_time: to_datetime((config.now)()),
                 start_instant: Instant::now(),
                 nonce: rand::random(),
                 experimental_mode,
@@ -520,6 +513,7 @@ impl Catalog {
                 build_info: config.build_info,
                 num_workers: config.num_workers,
                 timestamp_frequency: config.timestamp_frequency,
+                now: config.now,
             },
         };
 
@@ -601,7 +595,6 @@ impl Catalog {
                         name.clone(),
                         CatalogItem::Source(Source {
                             create_sql: "TODO".to_string(),
-                            plan_cx: PlanContext::default(),
                             optimized_expr,
                             connector: dataflow_types::SourceConnector::Local(
                                 Timeline::EpochMilliseconds,
@@ -633,7 +626,6 @@ impl Catalog {
                                 &log.variant.desc(),
                                 &log.variant.index_by(),
                             ),
-                            plan_cx: PlanContext::default(),
                             conn_id: None,
                             depends_on: vec![log.id],
                         }),
@@ -656,7 +648,6 @@ impl Catalog {
                         name.clone(),
                         CatalogItem::Table(Table {
                             create_sql: "TODO".to_string(),
-                            plan_cx: PlanContext::default(),
                             desc: table.desc.clone(),
                             defaults: vec![Expr::null(); table.desc.arity()],
                             conn_id: None,
@@ -679,7 +670,6 @@ impl Catalog {
                                 .map(|i| MirScalarExpr::Column(*i))
                                 .collect(),
                             create_sql: index_sql,
-                            plan_cx: PlanContext::default(),
                             conn_id: None,
                             depends_on: vec![table.id],
                         }),
@@ -688,7 +678,7 @@ impl Catalog {
 
                 Builtin::View(view) if config.enable_logging || !view.needs_logs => {
                     let item = catalog
-                        .parse_item(view.sql.into(), PlanContext::default())
+                        .parse_item(view.sql.into(), None)
                         .unwrap_or_else(|e| {
                             panic!(
                                 "internal error: failed to load bootstrap view:\n\
@@ -713,7 +703,6 @@ impl Catalog {
                         },
                         CatalogItem::Type(Type {
                             create_sql: format!("CREATE TYPE {}", typ.name()),
-                            plan_cx: PlanContext::default(),
                             inner: match typ.kind() {
                                 postgres_types::Kind::Array(element_type) => {
                                     let element_id = catalog.ambient_schemas[PG_CATALOG_SCHEMA]
@@ -735,10 +724,7 @@ impl Catalog {
                         func.id,
                         oid,
                         name.clone(),
-                        CatalogItem::Func(Func {
-                            plan_cx: PlanContext::default(),
-                            inner: func.inner,
-                        }),
+                        CatalogItem::Func(Func { inner: func.inner }),
                     );
                 }
 
@@ -828,7 +814,7 @@ impl Catalog {
     /// This function should not be called in production contexts. Use
     /// [`Catalog::open`] with appropriately set configuration parameters
     /// instead.
-    pub fn open_debug(path: &Path) -> Result<Catalog, anyhow::Error> {
+    pub fn open_debug(path: &Path, now: NowFn) -> Result<Catalog, anyhow::Error> {
         let (catalog, _) = Self::open(&Config {
             path,
             enable_logging: true,
@@ -838,6 +824,7 @@ impl Catalog {
             build_info: &DUMMY_BUILD_INFO,
             num_workers: 0,
             timestamp_frequency: Duration::from_secs(1),
+            now,
         })?;
         Ok(catalog)
     }
@@ -1669,7 +1656,6 @@ impl Catalog {
                     name,
                     item,
                 } => {
-                    metrics::item_created(id, &item);
                     self.insert_item(id, oid, name, item);
                     builtin_table_updates.extend(self.pack_item_update(id, 1));
                 }
@@ -1697,7 +1683,6 @@ impl Catalog {
                     if !metadata.item.is_placeholder() {
                         info!("drop {} {} ({})", metadata.item_type(), metadata.name, id);
                     }
-                    metrics::item_dropped(id, &metadata.item);
                     for u in metadata.uses() {
                         if let Some(dep_metadata) = self.by_id.get_mut(&u) {
                             dep_metadata.used_by.retain(|u| *u != metadata.id)
@@ -1757,27 +1742,27 @@ impl Catalog {
         let item = match item {
             CatalogItem::Table(table) => SerializedCatalogItem::V1 {
                 create_sql: table.create_sql.clone(),
-                eval_env: Some(table.plan_cx.clone().into()),
+                eval_env: None,
             },
             CatalogItem::Source(source) => SerializedCatalogItem::V1 {
                 create_sql: source.create_sql.clone(),
-                eval_env: Some(source.plan_cx.clone().into()),
+                eval_env: None,
             },
             CatalogItem::View(view) => SerializedCatalogItem::V1 {
                 create_sql: view.create_sql.clone(),
-                eval_env: Some(view.plan_cx.clone().into()),
+                eval_env: None,
             },
             CatalogItem::Index(index) => SerializedCatalogItem::V1 {
                 create_sql: index.create_sql.clone(),
-                eval_env: Some(index.plan_cx.clone().into()),
+                eval_env: None,
             },
             CatalogItem::Sink(sink) => SerializedCatalogItem::V1 {
                 create_sql: sink.create_sql.clone(),
-                eval_env: Some(sink.plan_cx.clone().into()),
+                eval_env: None,
             },
             CatalogItem::Type(typ) => SerializedCatalogItem::V1 {
                 create_sql: typ.create_sql.clone(),
-                eval_env: Some(typ.plan_cx.clone().into()),
+                eval_env: None,
             },
             CatalogItem::Func(_) => unreachable!("cannot serialize functions yet"),
         };
@@ -1787,31 +1772,23 @@ impl Catalog {
     fn deserialize_item(&self, bytes: Vec<u8>) -> Result<CatalogItem, anyhow::Error> {
         let SerializedCatalogItem::V1 {
             create_sql,
-            eval_env,
+            eval_env: _,
         } = serde_json::from_slice(&bytes)?;
-        let pcx = match eval_env {
-            // Old sources and sinks don't have plan contexts, but it's safe to
-            // just give them a default, as they clearly don't depend on the
-            // plan context.
-            None => PlanContext::default(),
-            Some(eval_env) => eval_env.into(),
-        };
-        self.parse_item(create_sql, pcx)
+        self.parse_item(create_sql, Some(&PlanContext::zero()))
     }
 
     fn parse_item(
         &self,
         create_sql: String,
-        pcx: PlanContext,
+        pcx: Option<&PlanContext>,
     ) -> Result<CatalogItem, anyhow::Error> {
         let stmt = sql::parse::parse(&create_sql)?.into_element();
-        let plan = sql::plan::plan(&pcx, &self.for_system_session(), stmt, &Params::empty())?;
+        let plan = sql::plan::plan(pcx, &self.for_system_session(), stmt, &Params::empty())?;
         Ok(match plan {
             Plan::CreateTable(CreateTablePlan {
                 table, depends_on, ..
             }) => CatalogItem::Table(Table {
                 create_sql: table.create_sql,
-                plan_cx: pcx,
                 desc: table.desc,
                 defaults: table.defaults,
                 conn_id: None,
@@ -1823,7 +1800,6 @@ impl Catalog {
                 let transformed_desc = RelationDesc::new(optimized_expr.typ(), source.column_names);
                 CatalogItem::Source(Source {
                     create_sql: source.create_sql,
-                    plan_cx: pcx,
                     optimized_expr,
                     connector: source.connector,
                     bare_desc: source.bare_desc,
@@ -1838,7 +1814,6 @@ impl Catalog {
                 let desc = RelationDesc::new(optimized_expr.typ(), view.column_names);
                 CatalogItem::View(View {
                     create_sql: view.create_sql,
-                    plan_cx: pcx,
                     optimized_expr,
                     desc,
                     conn_id: None,
@@ -1849,7 +1824,6 @@ impl Catalog {
                 index, depends_on, ..
             }) => CatalogItem::Index(Index {
                 create_sql: index.create_sql,
-                plan_cx: pcx,
                 on: index.on,
                 keys: index.keys,
                 conn_id: None,
@@ -1862,7 +1836,6 @@ impl Catalog {
                 ..
             }) => CatalogItem::Sink(Sink {
                 create_sql: sink.create_sql,
-                plan_cx: pcx,
                 from: sink.from,
                 connector: SinkConnectorState::Pending(sink.connector_builder),
                 envelope: sink.envelope,
@@ -1873,7 +1846,6 @@ impl Catalog {
                 typ, depends_on, ..
             }) => CatalogItem::Type(Type {
                 create_sql: typ.create_sql,
-                plan_cx: pcx,
                 inner: typ.inner.into(),
                 depends_on,
             }),
@@ -2023,26 +1995,40 @@ impl Catalog {
     }
 
     /// Returns all tables, views, and sources in the same schemas as a set of
-    /// input ids.
-    pub fn schema_adjacent_relations(&self, sources: &[GlobalId], conn_id: u32) -> Vec<GlobalId> {
+    /// input ids. The indexes of all relations are included.
+    pub fn schema_adjacent_indexed_relations(
+        &self,
+        ids: &[GlobalId],
+        conn_id: u32,
+    ) -> Vec<GlobalId> {
         // Find all relations referenced by the expression. Find their parent schemas
         // and add all tables, views, and sources in those schemas to a set.
-        let mut ids = HashSet::new();
-        for id in sources {
+        let mut relations: HashSet<GlobalId> = HashSet::new();
+        for id in ids {
+            // Always add in the user-specified ids.
+            relations.insert(*id);
             let entry = self.get_by_id(&id);
             let name = entry.name();
             if let Some(schema) = self.get_schema(&name.database, &name.schema, conn_id) {
                 for id in schema.items.values() {
-                    if let SqlCatalogItemType::Table
-                    | SqlCatalogItemType::View
-                    | SqlCatalogItemType::Source = self.get_by_id(id).item_type()
-                    {
-                        ids.insert(*id);
+                    match self.get_by_id(id).item_type() {
+                        SqlCatalogItemType::Table => {
+                            relations.insert(*id);
+                        }
+                        SqlCatalogItemType::View | SqlCatalogItemType::Source => {
+                            let (indexes, unmaterialized) = self.nearest_indexes(&[*id]);
+                            relations.extend(indexes);
+                            // Add in the view/source if fully materialized.
+                            if unmaterialized.is_empty() {
+                                relations.insert(*id);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
         }
-        ids.into_iter().collect()
+        relations.into_iter().collect()
     }
 }
 
@@ -2212,14 +2198,6 @@ impl ExprHumanizer for ConnCatalog<'_> {
             }
         }
     }
-
-    fn humanize_column_type(&self, typ: &ColumnType) -> String {
-        format!(
-            "{}{}",
-            self.humanize_scalar_type(&typ.scalar_type),
-            if typ.nullable { "?" } else { "" }
-        )
-    }
 }
 
 impl SqlCatalog for ConnCatalog<'_> {
@@ -2376,6 +2354,10 @@ impl SqlCatalog for ConnCatalog<'_> {
     fn config(&self) -> &sql::catalog::CatalogConfig {
         &self.catalog.config
     }
+
+    fn now(&self) -> EpochMillis {
+        (self.catalog.config.now)()
+    }
 }
 
 impl sql::catalog::CatalogDatabase for Database {
@@ -2442,18 +2424,6 @@ impl sql::catalog::CatalogItem for CatalogEntry {
             CatalogItem::Index(Index { create_sql, .. }) => create_sql,
             CatalogItem::Type(Type { create_sql, .. }) => create_sql,
             CatalogItem::Func(_) => "TODO",
-        }
-    }
-
-    fn plan_cx(&self) -> &PlanContext {
-        match self.item() {
-            CatalogItem::Table(Table { plan_cx, .. }) => plan_cx,
-            CatalogItem::Source(Source { plan_cx, .. }) => plan_cx,
-            CatalogItem::Sink(Sink { plan_cx, .. }) => plan_cx,
-            CatalogItem::View(View { plan_cx, .. }) => plan_cx,
-            CatalogItem::Index(Index { plan_cx, .. }) => plan_cx,
-            CatalogItem::Type(Type { plan_cx, .. }) => plan_cx,
-            CatalogItem::Func(Func { plan_cx, .. }) => plan_cx,
         }
     }
 
@@ -2547,7 +2517,7 @@ mod tests {
         ];
 
         let catalog_file = NamedTempFile::new()?;
-        let catalog = Catalog::open_debug(catalog_file.path())?;
+        let catalog = Catalog::open_debug(catalog_file.path(), ore::now::now_zero)?;
         for tc in test_cases {
             assert_eq!(
                 catalog

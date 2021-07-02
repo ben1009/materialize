@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use abomonation::abomonated::Abomonated;
 
 use crate::error::Error;
-use crate::indexed::{BlobFutureBatch, BlobMeta, BlobTraceBatch};
+use crate::indexed::encoding::{BlobFutureBatch, BlobMeta, BlobTraceBatch};
 use crate::storage::Blob;
 
 /// A disk-backed cache for objects in [Blob] storage.
@@ -60,6 +60,14 @@ impl<L: Blob> BlobCache<L> {
         }
     }
 
+    /// Synchronously closes the cache, releasing exclusive-writer locks and
+    /// causing all future commands to error.
+    ///
+    /// This method is idempotent.
+    pub fn close(&mut self) -> Result<(), Error> {
+        self.blob.lock()?.close()
+    }
+
     /// Returns the batch for the given key, blocking to fetch if it's not
     /// already in the cache.
     pub fn get_future_batch(&self, key: &str) -> Result<Arc<BlobFutureBatch>, Error> {
@@ -75,16 +83,17 @@ impl<L: Blob> BlobCache<L> {
             .blob
             .lock()?
             .get(key)?
-            .ok_or_else(|| Error::from(format!("no blob for key: {}", key)))?
-            .clone();
-        let val: Abomonated<BlobFutureBatch, Vec<u8>> = unsafe { Abomonated::new(bytes) }
+            .ok_or_else(|| Error::from(format!("no blob for key: {}", key)))?;
+        let batch: Abomonated<BlobFutureBatch, Vec<u8>> = unsafe { Abomonated::new(bytes) }
             .ok_or_else(|| Error::from(format!("invalid batch at key: {}", key)))?;
 
         // NB: Batch blobs are write-once, so we're not worried about the race
         // of two get calls for the same key.
         let mut cache = self.future.lock()?;
         // TODO: Well this is ugly.
-        cache.insert(key.to_owned(), Arc::new((*val).clone()));
+        let batch = (*batch).clone();
+        debug_assert_eq!(batch.validate(), Ok(()), "{:?}", &batch);
+        cache.insert(key.to_owned(), Arc::new(batch));
         Ok(cache.get(key).unwrap().clone())
     }
 
@@ -93,6 +102,7 @@ impl<L: Blob> BlobCache<L> {
         if key == Self::META_KEY {
             return Err(format!("cannot write trace batch to meta key: {}", Self::META_KEY).into());
         }
+        debug_assert_eq!(batch.validate(), Ok(()), "{:?}", &batch);
 
         let mut val = Vec::new();
         unsafe { abomonation::encode(&batch, &mut val) }.expect("write to Vec is infallible");
@@ -116,16 +126,17 @@ impl<L: Blob> BlobCache<L> {
             .blob
             .lock()?
             .get(key)?
-            .ok_or_else(|| Error::from(format!("no blob for key: {}", key)))?
-            .clone();
-        let val: Abomonated<BlobTraceBatch, Vec<u8>> = unsafe { Abomonated::new(bytes) }
+            .ok_or_else(|| Error::from(format!("no blob for key: {}", key)))?;
+        let batch: Abomonated<BlobTraceBatch, Vec<u8>> = unsafe { Abomonated::new(bytes) }
             .ok_or_else(|| Error::from(format!("invalid batch at key: {}", key)))?;
 
         // NB: Batch blobs are write-once, so we're not worried about the race
         // of two get calls for the same key.
         let mut cache = self.trace.lock()?;
         // TODO: Well this is ugly.
-        cache.insert(key.to_owned(), Arc::new((*val).clone()));
+        let batch = (*batch).clone();
+        debug_assert_eq!(batch.validate(), Ok(()), "{:?}", &batch);
+        cache.insert(key.to_owned(), Arc::new(batch));
         Ok(cache.get(key).unwrap().clone())
     }
 
@@ -134,6 +145,7 @@ impl<L: Blob> BlobCache<L> {
         if key == Self::META_KEY {
             return Err(format!("cannot write trace batch to meta key: {}", Self::META_KEY).into());
         }
+        debug_assert_eq!(batch.validate(), Ok(()), "{:?}", &batch);
 
         let mut val = Vec::new();
         unsafe { abomonation::encode(&batch, &mut val) }.expect("write to Vec is infallible");
@@ -148,16 +160,17 @@ impl<L: Blob> BlobCache<L> {
         let bytes = match blob.get(Self::META_KEY)? {
             Some(bytes) => bytes,
             None => return Ok(None),
-        }
-        .to_owned();
-        let val: Abomonated<BlobMeta, Vec<u8>> = unsafe { Abomonated::new(bytes) }
+        };
+        let meta: Abomonated<BlobMeta, Vec<u8>> = unsafe { Abomonated::new(bytes) }
             .ok_or_else(|| Error::from(format!("invalid meta at key: {}", Self::META_KEY)))?;
-        let m = (*val).clone();
-        Ok(Some(m))
+        let meta = (*meta).clone();
+        debug_assert_eq!(meta.validate(), Ok(()), "{:?}", &meta);
+        Ok(Some(meta))
     }
 
     /// Overwrites metadata about what batches are in [Blob] storage.
     pub fn set_meta(&self, meta: BlobMeta) -> Result<(), Error> {
+        debug_assert_eq!(meta.validate(), Ok(()), "{:?}", &meta);
         let mut val = Vec::new();
         unsafe { abomonation::encode(&meta, &mut val) }.expect("write to Vec is infallible");
         self.blob.lock()?.set(Self::META_KEY, val, true)

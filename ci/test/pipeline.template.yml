@@ -83,9 +83,11 @@ steps:
     timeout_in_minutes: 30
     inputs: [test/testdrive]
     plugins:
+      - ./ci/plugins/scratch-aws-access: ~
       - ./ci/plugins/mzcompose:
           composition: testdrive
           run: ci
+
 
   - id: testdrive-proxy
     label: ":squid: testdrive proxy"
@@ -93,6 +95,7 @@ steps:
     timeout_in_minutes: 30
     inputs: [test/testdrive]
     plugins:
+      - ./ci/plugins/scratch-aws-access: ~
       - ./ci/plugins/mzcompose:
           composition: testdrive
           run: ci-proxy
@@ -103,6 +106,7 @@ steps:
     timeout_in_minutes: 30
     inputs: [test/testdrive/proxy]
     plugins:
+      - ./ci/plugins/scratch-aws-access: ~
       - ./ci/plugins/mzcompose:
           composition: testdrive
           run: ci-proxy
@@ -161,6 +165,7 @@ steps:
     depends_on: build
     timeout_in_minutes: 30
     plugins:
+      - ./ci/plugins/scratch-aws-access: ~
       - ./ci/plugins/mzcompose:
           composition: perf-kinesis
           run: ci
@@ -272,6 +277,15 @@ steps:
       - ./ci/plugins/mzcompose:
           composition: pg-cdc-resumption
           run: pg-cdc-resumption
+
+  - id: s3-resumption
+    label: "S3 Retry/Resumption test"
+    depends_on: build
+    inputs: [test/s3-resumption]
+    plugins:
+      - ./ci/plugins/mzcompose:
+          composition: s3-resumption
+          run: s3-resumption
 
   - id: kafka-exactly-once
     label: "Test for the Kafka exactly-once sink"

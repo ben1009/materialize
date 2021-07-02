@@ -14,7 +14,7 @@ weight: 2
 You can access Materialize through the `materialized` binary, which you can
 install on macOS and Linux, or [build](#build-from-source) on most OSes (e.g. FreeBSD). These
 instructions install the latest release of Materialize, **{{< version >}}**. The latest (unstable)
-developer builds are available at https://mtrlz.dev/. For prior releases,
+developer builds are available at https://dev.materialize.com/. For prior releases,
 see the [Versions page](/versions).
 
 **Have any questions?** [Contact us](https://materialize.com/contact/)
@@ -44,7 +44,7 @@ brew install MaterializeInc/materialize/materialized
 ### curl
 
 ```shell
-curl -L https://downloads.mtrlz.dev/materialized-{{< version >}}-x86_64-apple-darwin.tar.gz \
+curl -L https://binaries.materialize.com/materialized-{{< version >}}-x86_64-apple-darwin.tar.gz \
     | tar -xzC /usr/local --strip-components=1
 ```
 
@@ -69,7 +69,7 @@ apt install materialized
 
 ### curl
 ```shell
-curl -L https://downloads.mtrlz.dev/materialized-{{< version >}}-x86_64-unknown-linux-gnu.tar.gz \
+curl -L https://binaries.materialize.com/materialized-{{< version >}}-x86_64-unknown-linux-gnu.tar.gz \
     | tar -xzC /usr/local --strip-components=1
 ```
 

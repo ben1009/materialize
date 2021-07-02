@@ -22,6 +22,7 @@ from materialize import git
 from materialize import mzbuild
 from materialize import spawn
 from . import deploy_util
+from .deploy_util import apt_materialized_path, APT_BUCKET
 
 
 def main() -> None:
@@ -40,12 +41,20 @@ def main() -> None:
         publish_deb("materialized-unstable", deb.unstable_version(workspace))
 
     print(f"--- Tagging Docker images")
+    deps = repo.resolve_dependencies(image for image in repo if image.publish)
+    deps.acquire()
+
     if buildkite_tag:
-        tag_docker(repo, buildkite_tag)
-        tag_docker_latest_maybe(repo, buildkite_tag)
+        # On tag builds, always tag the images as such.
+        deps.push_tagged(buildkite_tag)
+
+        # Also tag the images as `latest` if this is the latest version.
+        version = semver.VersionInfo.parse(buildkite_tag.lstrip("v"))
+        latest_version = next(t for t in git.get_version_tags() if t.prerelease is None)
+        if version == latest_version:
+            deps.push_tagged("latest")
     else:
-        tag_docker(repo, f'unstable-{git.rev_parse("HEAD")}')
-        tag_docker(repo, "unstable")
+        deps.push_tagged("unstable")
 
     print("--- Uploading binary tarball")
     mz_path = Path("materialized")
@@ -56,19 +65,15 @@ def main() -> None:
 def publish_deb(package: str, version: str) -> None:
     print(f"{package} v{version}")
 
-    s3 = boto3.client("s3")
-    bucket = "apt.materialize.com"
-    object_key = f"pool/generic/m/ma/materialized-{version}.deb"
-    # Download the staged package (deb-s3 needs to get various metadata from it)
-    s3.download_file(bucket, object_key, f"materialized-{version}.deb")
-    # Import the private key into GPG
-    key = os.environ["GPG_KEY"]
-    gpg = subprocess.Popen(["gpg", "--import"], stdin=subprocess.PIPE)
-    gpg.communicate(key.encode("ascii"))
+    # Download the staged package, as deb-s3 needs various metadata from it.
+    boto3.client("s3").download_file(
+        APT_BUCKET, apt_materialized_path(version), f"materialized-{version}.deb"
+    )
 
-    # Make the package public
-    s3.put_object_acl(ACL="public-read", Key=object_key, Bucket=bucket)
-    # Run deb-s3 to update the repository (no need to upload the file again)
+    # Import our GPG signing key from the environment.
+    spawn.runv(["gpg", "--import"], stdin=os.environ["GPG_KEY"].encode("ascii"))
+
+    # Run deb-s3 to update the repository. No need to upload the file again.
     spawn.runv(
         [
             "deb-s3",
@@ -77,33 +82,12 @@ def publish_deb(package: str, version: str) -> None:
             "--skip-package-upload",
             "--sign",
             "-b",
-            bucket,
+            APT_BUCKET,
             "-c",
             "generic",
             f"./materialized-{version}.deb",
         ]
     )
-
-
-def tag_docker(repo: mzbuild.Repository, tag: str) -> None:
-    deps = repo.resolve_dependencies(image for image in repo if image.publish)
-    deps.acquire()
-    for dep in deps:
-        if dep.publish:
-            name = dep.image.docker_name(tag)
-            spawn.runv(["docker", "tag", dep.spec(), name])
-            spawn.runv(["docker", "push", name])
-
-
-def tag_docker_latest_maybe(repo: mzbuild.Repository, tag: str) -> None:
-    """If this tag is greater than all other tags, and is a release, tag it `latest`"""
-    this_tag = semver.VersionInfo.parse(tag.lstrip("v"))
-    if this_tag.prerelease is not None:
-        return
-
-    highest_release = next(t for t in git.get_version_tags() if t.prerelease is None)
-    if this_tag == highest_release:
-        tag_docker(repo, "latest")
 
 
 if __name__ == "__main__":
